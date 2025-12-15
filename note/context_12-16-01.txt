@@ -1,0 +1,600 @@
+# INVEST SYSTEM CONTEXT DUMP
+# Date: 2025-12-16 03:02:56.289811
+# Note: This file contains both the project structure and full code content.
+
+📦 PROJECT STRUCTURE
+==============================
+📂 ROOT/
+    📄 .env  # 环境变量/密钥 [核心]
+    📄 .gitignore  # Git忽略规则 [核心]
+    📄 requirements.txt  # Python依赖清单 [核心]
+    📂 ui/
+    📂 database/
+        📄 models.py  # SQLAlchemy数据库模型(ODS/DWS) [核心]
+    📂 interface/
+        📄 tushare_client.py  # Tushare接口封装(带重试) [核心]
+    📂 tools/
+        📄 doc_generator.py  # 上下文生成工具 [工具]
+    📂 core/
+        📄 config.py  # 全局配置加载器 [核心]
+        📄 mapping.py  # 中英文映射字典 [核心]
+    📂 engine/
+        📄 updater.py  # 数据更新引擎 [核心]
+==============================
+
+💻 CODE CONTENT
+==============================
+
+------------------------------------------------------------
+FILE PATH: .env
+------------------------------------------------------------
+# Tushare Pro Token
+TS_TOKEN=d31522f5187757bed3b2a67f8ed4af58473e0a20271407e84d70f063
+
+# Database Connection
+# 格式: postgresql://用户:密码@主机:端口/数据库名
+DB_URL=postgresql://ze:Kim00@localhost:5432/invest_sys
+
+------------------------------------------------------------
+FILE PATH: .gitignore
+------------------------------------------------------------
+# System
+.DS_Store
+*.log
+__pycache__/
+
+# Python
+venv/
+*.pyc
+
+# Configuration & Secrets (绝对不能上传!)
+.env
+core/__pycache__
+
+# IDE
+.vscode/
+.idea/
+
+# Data (可选，如果不想上传临时下载的数据)
+data/*
+!data/.gitkeep
+
+------------------------------------------------------------
+FILE PATH: requirements.txt
+------------------------------------------------------------
+# Data Source
+tushare>=1.2.89
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Database (PostgreSQL + SQLAlchemy 2.0)
+SQLAlchemy>=2.0.0
+psycopg2-binary>=2.9.0
+
+# UI Framework
+nicegui>=1.4.0
+
+# Utilities
+python-dotenv>=1.0.0
+pyyaml>=6.0
+
+
+------------------------------------------------------------
+FILE PATH: database/models.py
+------------------------------------------------------------
+from sqlalchemy import Column, String, Float, Boolean, DateTime, Integer, Text, PrimaryKeyConstraint
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
+from sqlalchemy import create_engine
+from datetime import datetime
+from core.config import settings
+
+# 1. 数据库连接引擎
+engine = create_engine(settings.DB_URL)
+
+# 2. 会话工厂 (这就是报错缺失的部分)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+class Base(DeclarativeBase):
+    pass
+
+# --- Meta Data Layer (基础信息) ---
+
+class StockBasic(Base):
+    """
+    股票基础信息表 (PRD 4.1)
+    """
+    __tablename__ = "stock_basic"
+
+    ts_code = Column(String(20), primary_key=True, comment="TS代码")
+    symbol = Column(String(20), comment="股票代码")
+    name = Column(String(50), comment="股票名称")
+    area = Column(String(50), comment="地域")
+    industry = Column(String(50), comment="所属行业")
+    market = Column(String(50), comment="市场类型")
+    list_date = Column(String(8), comment="上市日期")
+    
+    # 核心字段: 标记是否为中证800 (PRD 1.2)
+    is_csi800 = Column(Boolean, default=False, index=True, comment="是否中证800")
+
+class Watchlist(Base):
+    """
+    用户自选股池 (PRD 1.2)
+    """
+    __tablename__ = "watchlist"
+
+    ts_code = Column(String(20), primary_key=True)
+    name = Column(String(50))
+    industry = Column(String(50))
+    weight = Column(Float, default=1.0, comment="权重")
+    add_time = Column(DateTime, default=datetime.now)
+
+# --- ODS Layer (原始数据层 - Store Everything) ---
+
+class ODSMarketDaily(Base):
+    """
+    日线行情 (PRD 2.1)
+    """
+    __tablename__ = "ods_market_daily"
+
+    ts_code = Column(String(20), primary_key=True)
+    trade_date = Column(String(8), primary_key=True, index=True)
+    open = Column(Float)
+    high = Column(Float)
+    low = Column(Float)
+    close = Column(Float)
+    pre_close = Column(Float)
+    change = Column(Float)
+    pct_chg = Column(Float)
+    vol = Column(Float, comment="成交量(手)")
+    amount = Column(Float, comment="成交额(千元)")
+
+class ODSAdjFactor(Base):
+    """
+    复权因子 (PRD 2.1)
+    """
+    __tablename__ = "ods_adj_factor"
+
+    ts_code = Column(String(20), primary_key=True)
+    trade_date = Column(String(8), primary_key=True)
+    adj_factor = Column(Float)
+
+class ODSFinanceReport(Base):
+    """
+    通用财务报表存储 (PRD 4.2)
+    策略: JSONB 宽表模式
+    """
+    __tablename__ = "ods_finance_report"
+
+    # 复合主键
+    ts_code = Column(String(20), primary_key=True)
+    end_date = Column(String(8), primary_key=True, comment="报告期")
+    report_type = Column(String(10), primary_key=True, comment="报表类型")
+    update_flag = Column(String(5), primary_key=True, default='0', comment="更新标记")
+    
+    ann_date = Column(String(8), comment="公告日期")
+    
+    # 核心字段
+    data = Column(JSONB, comment="原始财务数据JSON")
+    category = Column(String(20), index=True, comment="报表类别")
+
+# --- 工具函数 ---
+def init_db():
+    """初始化数据库表结构"""
+    Base.metadata.create_all(bind=engine)
+
+------------------------------------------------------------
+FILE PATH: interface/tushare_client.py
+------------------------------------------------------------
+import tushare as ts
+import pandas as pd
+import time
+from core.config import settings
+from functools import wraps
+
+class TushareClient:
+    def __init__(self):
+        if not settings.TS_TOKEN:
+            raise ValueError("Tushare Token is missing in settings")
+        
+        # 初始化 Pro 接口 (PRD 1.1)
+        self.pro = ts.pro_api(settings.TS_TOKEN)
+        print(f"📡 Tushare Client Initialized. Token: {settings.TS_TOKEN[:5]}***")
+
+    def retry_policy(func):
+        """
+        装饰器: Tushare 官方建议的重试机制
+        Ref: Tushare PDF [cite: 18]
+        """
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            max_retries = 3
+            for i in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    print(f"⚠️ API Warning: {e}, Retrying ({i+1}/{max_retries})...")
+                    time.sleep(1)
+            raise Exception(f"❌ API Failed after {max_retries} retries.")
+        return wrapper
+
+    # --- 1. 基础数据 ---
+    
+    @retry_policy
+    def fetch_stock_basic(self):
+        """获取全市场股票列表 (PRD 2.1)"""
+        fields = 'ts_code,symbol,name,area,industry,market,list_date'
+        return self.pro.stock_basic(exchange='', list_status='L', fields=fields)
+
+    # --- 2. 市场行情 (Column Storage) ---
+
+    @retry_policy
+    def fetch_daily(self, ts_code=None, trade_date=None, start_date=None, end_date=None):
+        """
+        日线行情
+        Ref: Tushare PDF Daily Interface [cite: 252]
+        """
+        return self.pro.daily(ts_code=ts_code, trade_date=trade_date, 
+                              start_date=start_date, end_date=end_date)
+
+    @retry_policy
+    def fetch_adj_factor(self, ts_code=None, trade_date=None, start_date=None, end_date=None):
+        """复权因子"""
+        return self.pro.adj_factor(ts_code=ts_code, trade_date=trade_date, 
+                                   start_date=start_date, end_date=end_date)
+
+    # --- 3. 财务数据 (JSONB Storage) ---
+    # PRD 要求: Store Everything, JSONB 宽表模式
+    # 关键点: 必须获取 update_flag 以区分修正报表 
+
+    def _fetch_financial(self, api_func, ts_code, start_date, end_date):
+        """通用财报获取逻辑"""
+        # 强制指定字段，确保 update_flag 存在
+        fields = 'ts_code,ann_date,f_ann_date,end_date,report_type,comp_type,update_flag'
+        
+        # 注意: Tushare 的财报接口字段非常多，这里我们不枚举所有 metrics，
+        # 而是依赖 Tushare 默认返回 (API 会返回该报表的所有字段)，
+        # 我们只显式确保 meta 字段存在。
+        # 实际上，如果不传 fields，Tushare 默认返回所有字段，这正符合我们 JSONB 全量存储的需求。
+        # 但为了稳健，我们在外部调用时如果不传 fields，它就是全量的。
+        
+        return api_func(ts_code=ts_code, start_date=start_date, end_date=end_date)
+
+    @retry_policy
+    def fetch_income(self, ts_code, start_date, end_date):
+        """利润表"""
+        return self.pro.income(ts_code=ts_code, start_date=start_date, end_date=end_date)
+
+    @retry_policy
+    def fetch_balancesheet(self, ts_code, start_date, end_date):
+        """资产负债表"""
+        return self.pro.balancesheet(ts_code=ts_code, start_date=start_date, end_date=end_date)
+
+    @retry_policy
+    def fetch_cashflow(self, ts_code, start_date, end_date):
+        """现金流量表"""
+        return self.pro.cashflow(ts_code=ts_code, start_date=start_date, end_date=end_date)
+
+    @retry_policy
+    def fetch_fina_indicator(self, ts_code, start_date, end_date):
+        """财务指标表"""
+        return self.pro.fina_indicator(ts_code=ts_code, start_date=start_date, end_date=end_date)
+
+# 单例模式
+ts_client = TushareClient()
+
+------------------------------------------------------------
+FILE PATH: tools/doc_generator.py
+------------------------------------------------------------
+import os
+import datetime
+
+# --- 配置区域 ---
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'note')
+
+# 忽略规则
+IGNORE_DIRS = {'venv', '__pycache__', '.git', '.idea', '.vscode', 'data', 'temp', 'note', 'dist', 'build'}
+IGNORE_FILES = {'.DS_Store', 'poetry.lock', 'package-lock.json', 'LICENSE'}
+# 只读取文本代码文件
+INCLUDE_EXTENSIONS = ('.py', '.txt', '.md', '.env', '.gitignore', '.ini', '.yaml', '.yml', '.sh')
+
+# 文件注释字典 (辅助 AI 理解文件用途)
+FILE_META = {
+    "requirements.txt": "Python依赖清单 [核心]",
+    ".env": "环境变量/密钥 [核心]",
+    ".gitignore": "Git忽略规则 [核心]",
+    "core/config.py": "全局配置加载器 [核心]",
+    "core/mapping.py": "中英文映射字典 [核心]",
+    "database/models.py": "SQLAlchemy数据库模型(ODS/DWS) [核心]",
+    "interface/tushare_client.py": "Tushare接口封装(带重试) [核心]",
+    "engine/updater.py": "数据更新引擎 [核心]",
+    "tools/doc_generator.py": "上下文生成工具 [工具]",
+    "tools/db_inspector.py": "数据库体检工具 [工具]",
+}
+
+def get_today_seq():
+    """生成 mm-dd-NN 格式的编号"""
+    today = datetime.datetime.now().strftime("%m-%d")
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
+    
+    # 查找当日已有的最大序号
+    max_seq = 0
+    for f in os.listdir(OUTPUT_DIR):
+        if f.startswith(f"context_{today}"):
+            try:
+                # 假设格式: context_12-15-01.txt
+                parts = f.split('.')[0].split('-')
+                seq = int(parts[-1])
+                if seq > max_seq:
+                    max_seq = seq
+            except:
+                pass
+    return f"{today}-{max_seq + 1:02d}"
+
+def get_tree_str():
+    """生成目录树字符串"""
+    lines = []
+    lines.append(f"📦 PROJECT STRUCTURE")
+    lines.append(f"{'='*30}")
+    
+    for root, dirs, files in os.walk(PROJECT_ROOT):
+        # 过滤目录
+        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+        
+        level = root.replace(PROJECT_ROOT, '').count(os.sep)
+        indent = ' ' * 4 * level
+        folder_name = os.path.basename(root)
+        if folder_name == os.path.basename(PROJECT_ROOT):
+            folder_name = "ROOT"
+            
+        lines.append(f"{indent}📂 {folder_name}/")
+        
+        for f in sorted(files):
+            if f in IGNORE_FILES:
+                continue
+            
+            # 添加注释
+            rel_path = os.path.relpath(os.path.join(root, f), PROJECT_ROOT)
+            meta = FILE_META.get(rel_path, "")
+            desc = f"  # {meta}" if meta else ""
+            
+            lines.append(f"{indent}    📄 {f}{desc}")
+            
+    lines.append(f"{'='*30}\n\n")
+    return "\n".join(lines)
+
+def generate_context_dump(seq):
+    """生成单一整合文件"""
+    filename = f"context_{seq}.txt"
+    filepath = os.path.join(OUTPUT_DIR, filename)
+    
+    tree_str = get_tree_str()
+    
+    with open(filepath, 'w', encoding='utf-8') as outfile:
+        # Header
+        outfile.write(f"# INVEST SYSTEM CONTEXT DUMP\n")
+        outfile.write(f"# Date: {datetime.datetime.now()}\n")
+        outfile.write(f"# Note: This file contains both the project structure and full code content.\n\n")
+        
+        # Part 1: Tree
+        outfile.write(tree_str)
+        
+        # Part 2: Content
+        outfile.write(f"💻 CODE CONTENT\n")
+        outfile.write(f"{'='*30}\n")
+        
+        file_count = 0
+        for root, dirs, files in os.walk(PROJECT_ROOT):
+            dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+            
+            for f in sorted(files):
+                if f in IGNORE_FILES or not f.endswith(INCLUDE_EXTENSIONS):
+                    continue
+                
+                abs_path = os.path.join(root, f)
+                rel_path = os.path.relpath(abs_path, PROJECT_ROOT)
+                
+                # 分隔符：让 AI 容易识别文件边界
+                outfile.write(f"\n{'-'*60}\n")
+                outfile.write(f"FILE PATH: {rel_path}\n")
+                outfile.write(f"{'-'*60}\n")
+                
+                try:
+                    with open(abs_path, 'r', encoding='utf-8') as infile:
+                        content = infile.read()
+                        outfile.write(content)
+                        outfile.write("\n") # 确保文件末尾有换行
+                        file_count += 1
+                except Exception as e:
+                    outfile.write(f"[Error reading file: {e}]\n")
+
+    print(f"✅ 上下文快照已生成: note/{filename}")
+    print(f"📊 包含目录结构 + {file_count} 个核心代码文件")
+
+if __name__ == "__main__":
+    seq_str = get_today_seq()
+    generate_context_dump(seq_str)
+
+------------------------------------------------------------
+FILE PATH: core/config.py
+------------------------------------------------------------
+import os
+from dotenv import load_dotenv
+
+# 加载 .env 文件
+load_dotenv()
+
+class Config:
+    # 基础鉴权
+    TS_TOKEN = os.getenv("TS_TOKEN")
+    DB_URL = os.getenv("DB_URL")
+    
+    # 系统常量 (PRD 1.3)
+    START_DATE = "20150101"
+    
+    # 完整性检查
+    if not TS_TOKEN:
+        raise ValueError("❌ 错误: 未在 .env 中找到 TS_TOKEN，请检查配置文件。")
+    if not DB_URL:
+        raise ValueError("❌ 错误: 未在 .env 中找到 DB_URL，请检查配置文件。")
+
+settings = Config()
+
+------------------------------------------------------------
+FILE PATH: core/mapping.py
+------------------------------------------------------------
+# 字段映射字典 (Key: DB/API Field, Value: Chinese Name)
+# Ref: Tushare Pro 字段字典
+
+FIELD_MAPPING = {
+    # --- 基础信息 ---
+    "ts_code": "TS代码",
+    "symbol": "股票代码",
+    "name": "股票名称",
+    "industry": "行业",
+    "area": "地域",
+    "list_date": "上市日期",
+    "is_csi800": "中证800",
+
+    # --- 日线行情 (Daily) ---
+    "trade_date": "交易日期",
+    "open": "开盘价",
+    "high": "最高价",
+    "low": "最低价",
+    "close": "收盘价",
+    "pre_close": "昨收价",
+    "change": "涨跌额",
+    "pct_chg": "涨跌幅(%)",
+    "vol": "成交量(手)",
+    "amount": "成交额(千元)",
+    "turnover_rate": "换手率(%)",
+    "pe_ttm": "市盈率(TTM)",
+    "pb": "市净率",
+    "total_mv": "总市值(万)",
+    "circ_mv": "流通市值(万)",
+
+    # --- 财务核心指标 (Indicator/Income/Cashflow) ---
+    "end_date": "报告期",
+    "ann_date": "公告日期",
+    "report_type": "报表类型",
+    
+    # 利润表 (Income) [cite: 526]
+    "total_revenue": "营业总收入",
+    "revenue": "营业收入",
+    "n_income_attr_p": "归母净利润",  # 核心字段
+    "operate_profit": "营业利润",
+    
+    # 资产负债表 (Balance Sheet) [cite: 549]
+    "total_assets": "资产总计",
+    "total_liab": "负债合计",
+    "total_hldr_eqy_exc_min_int": "股东权益合计(不含少数股东)", # 归母权益
+    "money_cap": "货币资金",
+    
+    # 现金流量表 (Cashflow) [cite: 587]
+    "n_cashflow_act": "经营活动现金净流量",
+    "n_cashflow_inv_act": "投资活动现金净流量",
+    "n_cashflow_fnc_act": "筹资活动现金净流量",
+
+    # 财务指标 (Indicator) [cite: 648]
+    "roe": "ROE",
+    "roe_dt": "ROE(扣非)",
+    "grossprofit_margin": "毛利率",
+    "netprofit_margin": "净利率",
+    "debt_to_assets": "资产负债率",
+    "current_ratio": "流动比率",
+}
+
+------------------------------------------------------------
+FILE PATH: engine/updater.py
+------------------------------------------------------------
+import pandas as pd
+from sqlalchemy.dialects.postgresql import insert
+from interface.tushare_client import ts_client
+from database.models import SessionLocal, StockBasic
+from core.config import settings
+from datetime import datetime
+
+class DataUpdater:
+    def __init__(self):
+        self.db = SessionLocal()
+
+    def sync_stock_list(self):
+        """
+        全量同步股票列表，并标记中证800成分股 (PRD 3.1)
+        """
+        print("🔄 开始同步股票基础列表...")
+        
+        # 1. 拉取全市场股票 (Tushare API)
+        df_basics = ts_client.fetch_stock_basic()
+        if df_basics.empty:
+            print("⚠️ 未获取到股票列表，任务终止")
+            return
+
+        # 2. 拉取中证800成分股 (用于标记核心资产)
+        # 000906.SH 是中证800指数代码
+        # 注意: index_weight 接口需要 2000 积分 
+        try:
+            # 获取最新一个月的成分股（这里简化逻辑，取上个月的成分）
+            # 实际生产中可能需要动态计算日期，这里暂取最近的逻辑
+            # Tushare Pro 的 index_weight 通常按月更新
+            now_str = datetime.now().strftime("%Y%m%d")
+            # 尝试拉取最新的成分
+            df_csi800 = ts_client.pro.index_weight(index_code='000906.SH', start_date='20240101', end_date=now_str)
+            
+            # 如果没取到（比如年初还没更新），可以尝试取去年的，这里做简单容错
+            if df_csi800.empty:
+                 print("⚠️ 警告: 未获取到中证800成分股，将跳过标记步骤")
+                 csi800_set = set()
+            else:
+                 # 取最新日期的成分
+                 latest_date = df_csi800['trade_date'].max()
+                 df_latest = df_csi800[df_csi800['trade_date'] == latest_date]
+                 csi800_set = set(df_latest['con_code'].tolist())
+                 print(f"✅ 获取到中证800成分股 ({latest_date}): {len(csi800_set)} 只")
+
+        except Exception as e:
+            print(f"⚠️ 中证800接口调用失败: {e}")
+            csi800_set = set()
+
+        # 3. 数据处理与标记
+        # 默认全部 False
+        df_basics['is_csi800'] = False
+        # 如果代码在 csi800_set 中，设为 True
+        if csi800_set:
+            df_basics.loc[df_basics['ts_code'].isin(csi800_set), 'is_csi800'] = True
+
+        # 4. 写入数据库 (Upsert 模式)
+        # 使用 SQLAlchemy Core 的 bulk insert 效率较高，或者逐行 merge
+        # 这里为了演示清晰，使用 pandas to_sql 的替代方案或 ORM 循环
+        # 考虑到只有 5000 条数据，ORM 效率可接受
+        
+        count = 0
+        for _, row in df_basics.iterrows():
+            stock = StockBasic(
+                ts_code=row['ts_code'],
+                symbol=row['symbol'],
+                name=row['name'],
+                area=row['area'],
+                industry=row['industry'],
+                market=row['market'],
+                list_date=row['list_date'],
+                is_csi800=row['is_csi800']
+            )
+            self.db.merge(stock) # merge 会根据主键自动 insert 或 update
+            count += 1
+            
+        self.db.commit()
+        print(f"✅ 股票列表同步完成! 共处理: {count} 只, 其中中证800: {len(csi800_set)} 只")
+
+    def close(self):
+        self.db.close()
+
+# 快捷入口
+if __name__ == "__main__":
+    updater = DataUpdater()
+    updater.sync_stock_list()
+    updater.close()

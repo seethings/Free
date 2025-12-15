@@ -1,0 +1,17 @@
+# Data Source
+tushare>=1.2.89
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Database (PostgreSQL + SQLAlchemy 2.0)
+SQLAlchemy>=2.0.0
+psycopg2-binary>=2.9.0
+
+# UI Framework
+nicegui>=1.4.0
+
+# Utilities
+python-dotenv>=1.0.0
+pyyaml>=6.0

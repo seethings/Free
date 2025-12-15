@@ -1,0 +1,20 @@
+# System
+.DS_Store
+*.log
+__pycache__/
+
+# Python
+venv/
+*.pyc
+
+# Configuration & Secrets (绝对不能上传!)
+.env
+core/__pycache__
+
+# IDE
+.vscode/
+.idea/
+
+# Data (可选，如果不想上传临时下载的数据)
+data/*
+!data/.gitkeep
