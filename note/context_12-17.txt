@@ -1,5 +1,5 @@
 # INVEST SYSTEM CONTEXT DUMP
-# Date: 2025-12-17 00:11:01.244427
+# Timestamp: 2025-12-17 00:21:16.852297
 # Security: Sensitive files (.env) and temp dirs are EXCLUDED.
 
 📦 PROJECT STRUCTURE (Ignored: .env, temp/, note/, data/)
@@ -16,7 +16,7 @@
         📄 db_inspector.py  # 数据库体检工具 [工具]
         📄 debug_finance.py
         📄 doc_generator.py  # 上下文生成工具 [工具]
-        📄 git_auto.py
+        📄 git_auto.py  # Git自动助理 [工具]
     📂 core/
         📄 config.py  # 全局配置加载器 [核心]
         📄 mapping.py  # 中英文映射字典 [核心]
@@ -466,25 +466,24 @@ import datetime
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'note')
 
-# 1. 忽略目录 (新增/确认: temp, note, venv, data)
+# 1. 忽略目录
 IGNORE_DIRS = {
     'venv', '__pycache__', '.git', '.idea', '.vscode', 
     'data', 'temp', 'note', 'dist', 'build', 'logs'
 }
 
-# 2. 忽略文件 (新增: .env 绝对不能上传!)
+# 2. 忽略文件 (.env 绝对不能上传!)
 IGNORE_FILES = {
     '.DS_Store', 'poetry.lock', 'package-lock.json', 'LICENSE', 
     '.env', 'requirements.txt.bak'
 }
 
-# 3. 允许读取后缀 (移除 .env)
+# 3. 允许读取后缀
 INCLUDE_EXTENSIONS = ('.py', '.txt', '.md', '.gitignore', '.ini', '.yaml', '.yml', '.sh', '.json')
 
-# 文件注释字典 (辅助 AI 理解文件用途)
+# 文件注释字典
 FILE_META = {
     "requirements.txt": "Python依赖清单 [核心]",
-    # ".env": "环境变量/密钥 [核心]", # 已从生成列表中移除
     ".gitignore": "Git忽略规则 [核心]",
     "core/config.py": "全局配置加载器 [核心]",
     "core/mapping.py": "中英文映射字典 [核心]",
@@ -492,26 +491,20 @@ FILE_META = {
     "interface/tushare_client.py": "Tushare接口封装(带重试) [核心]",
     "engine/updater.py": "数据更新引擎 [核心]",
     "tools/doc_generator.py": "上下文生成工具 [工具]",
+    "tools/git_auto.py": "Git自动助理 [工具]",
     "tools/db_inspector.py": "数据库体检工具 [工具]",
 }
 
-def get_today_seq():
-    """生成 mm-dd-NN 格式的编号"""
+def get_daily_filename():
+    """
+    生成每日唯一的上下文文件名
+    格式: context_mm-dd.txt
+    策略: 每日仅生成一份，多次运行直接覆盖，避免文件爆炸
+    """
     today = datetime.datetime.now().strftime("%m-%d")
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
-    
-    max_seq = 0
-    for f in os.listdir(OUTPUT_DIR):
-        if f.startswith(f"context_{today}"):
-            try:
-                parts = f.split('.')[0].split('-')
-                seq = int(parts[-1])
-                if seq > max_seq:
-                    max_seq = seq
-            except:
-                pass
-    return f"{today}-{max_seq + 1:02d}"
+    return f"context_{today}.txt"
 
 def get_tree_str():
     """生成目录树字符串"""
@@ -532,12 +525,13 @@ def get_tree_str():
         lines.append(f"{indent}📂 {folder_name}/")
         
         for f in sorted(files):
-            # 严格过滤忽略文件
             if f in IGNORE_FILES:
                 continue
             
-            # 只有在白名单后缀里的文件才显示在树中，或者特定的配置文件
-            # 这里稍微放宽一点，让树结构完整些，但排除明确 ignore 的
+            # 简单的后缀过滤
+            if not any(f.endswith(ext) for ext in INCLUDE_EXTENSIONS) and f not in FILE_META:
+                continue
+
             rel_path = os.path.relpath(os.path.join(root, f), PROJECT_ROOT)
             meta = FILE_META.get(rel_path, "")
             desc = f"  # {meta}" if meta else ""
@@ -547,9 +541,9 @@ def get_tree_str():
     lines.append(f"{'='*50}\n\n")
     return "\n".join(lines)
 
-def generate_context_dump(seq):
+def generate_context_dump():
     """生成单一整合文件"""
-    filename = f"context_{seq}.txt"
+    filename = get_daily_filename()
     filepath = os.path.join(OUTPUT_DIR, filename)
     
     tree_str = get_tree_str()
@@ -557,7 +551,7 @@ def generate_context_dump(seq):
     with open(filepath, 'w', encoding='utf-8') as outfile:
         # Header
         outfile.write(f"# INVEST SYSTEM CONTEXT DUMP\n")
-        outfile.write(f"# Date: {datetime.datetime.now()}\n")
+        outfile.write(f"# Timestamp: {datetime.datetime.now()}\n")
         outfile.write(f"# Security: Sensitive files (.env) and temp dirs are EXCLUDED.\n\n")
         
         # Part 1: Tree
@@ -572,7 +566,6 @@ def generate_context_dump(seq):
             dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
             
             for f in sorted(files):
-                # 双重过滤：必须不在忽略列表 AND 必须在允许后缀列表
                 if f in IGNORE_FILES or not f.endswith(INCLUDE_EXTENSIONS):
                     continue
                 
@@ -592,12 +585,11 @@ def generate_context_dump(seq):
                 except Exception as e:
                     outfile.write(f"[Error reading file: {e}]\n")
 
-    print(f"✅ 安全上下文快照已生成: note/{filename}")
+    print(f"✅ 上下文快照已更新: note/{filename}")
     print(f"🛡️ 已屏蔽 .env 及临时目录 | 包含 {file_count} 个核心文件")
 
 if __name__ == "__main__":
-    seq_str = get_today_seq()
-    generate_context_dump(seq_str)
+    generate_context_dump()
 
 ------------------------------------------------------------
 FILE PATH: tools/git_auto.py
