@@ -1,11 +1,10 @@
 # INVEST SYSTEM CONTEXT DUMP
-# Date: 2025-12-16 03:02:56.289811
-# Note: This file contains both the project structure and full code content.
+# Date: 2025-12-16 03:15:21.407099
+# Security: Sensitive files (.env) and temp dirs are EXCLUDED.
 
-📦 PROJECT STRUCTURE
-==============================
+📦 PROJECT STRUCTURE (Ignored: .env, temp/, note/, data/)
+==================================================
 📂 ROOT/
-    📄 .env  # 环境变量/密钥 [核心]
     📄 .gitignore  # Git忽略规则 [核心]
     📄 requirements.txt  # Python依赖清单 [核心]
     📂 ui/
@@ -20,20 +19,10 @@
         📄 mapping.py  # 中英文映射字典 [核心]
     📂 engine/
         📄 updater.py  # 数据更新引擎 [核心]
-==============================
+==================================================
 
 💻 CODE CONTENT
-==============================
-
-------------------------------------------------------------
-FILE PATH: .env
-------------------------------------------------------------
-# Tushare Pro Token
-TS_TOKEN=d31522f5187757bed3b2a67f8ed4af58473e0a20271407e84d70f063
-
-# Database Connection
-# 格式: postgresql://用户:密码@主机:端口/数据库名
-DB_URL=postgresql://ze:Kim00@localhost:5432/invest_sys
+==================================================
 
 ------------------------------------------------------------
 FILE PATH: .gitignore
@@ -295,16 +284,25 @@ import datetime
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'note')
 
-# 忽略规则
-IGNORE_DIRS = {'venv', '__pycache__', '.git', '.idea', '.vscode', 'data', 'temp', 'note', 'dist', 'build'}
-IGNORE_FILES = {'.DS_Store', 'poetry.lock', 'package-lock.json', 'LICENSE'}
-# 只读取文本代码文件
-INCLUDE_EXTENSIONS = ('.py', '.txt', '.md', '.env', '.gitignore', '.ini', '.yaml', '.yml', '.sh')
+# 1. 忽略目录 (新增/确认: temp, note, venv, data)
+IGNORE_DIRS = {
+    'venv', '__pycache__', '.git', '.idea', '.vscode', 
+    'data', 'temp', 'note', 'dist', 'build', 'logs'
+}
+
+# 2. 忽略文件 (新增: .env 绝对不能上传!)
+IGNORE_FILES = {
+    '.DS_Store', 'poetry.lock', 'package-lock.json', 'LICENSE', 
+    '.env', 'requirements.txt.bak'
+}
+
+# 3. 允许读取后缀 (移除 .env)
+INCLUDE_EXTENSIONS = ('.py', '.txt', '.md', '.gitignore', '.ini', '.yaml', '.yml', '.sh', '.json')
 
 # 文件注释字典 (辅助 AI 理解文件用途)
 FILE_META = {
     "requirements.txt": "Python依赖清单 [核心]",
-    ".env": "环境变量/密钥 [核心]",
+    # ".env": "环境变量/密钥 [核心]", # 已从生成列表中移除
     ".gitignore": "Git忽略规则 [核心]",
     "core/config.py": "全局配置加载器 [核心]",
     "core/mapping.py": "中英文映射字典 [核心]",
@@ -321,12 +319,10 @@ def get_today_seq():
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
     
-    # 查找当日已有的最大序号
     max_seq = 0
     for f in os.listdir(OUTPUT_DIR):
         if f.startswith(f"context_{today}"):
             try:
-                # 假设格式: context_12-15-01.txt
                 parts = f.split('.')[0].split('-')
                 seq = int(parts[-1])
                 if seq > max_seq:
@@ -338,8 +334,8 @@ def get_today_seq():
 def get_tree_str():
     """生成目录树字符串"""
     lines = []
-    lines.append(f"📦 PROJECT STRUCTURE")
-    lines.append(f"{'='*30}")
+    lines.append(f"📦 PROJECT STRUCTURE (Ignored: .env, temp/, note/, data/)")
+    lines.append(f"{'='*50}")
     
     for root, dirs, files in os.walk(PROJECT_ROOT):
         # 过滤目录
@@ -354,17 +350,19 @@ def get_tree_str():
         lines.append(f"{indent}📂 {folder_name}/")
         
         for f in sorted(files):
+            # 严格过滤忽略文件
             if f in IGNORE_FILES:
                 continue
             
-            # 添加注释
+            # 只有在白名单后缀里的文件才显示在树中，或者特定的配置文件
+            # 这里稍微放宽一点，让树结构完整些，但排除明确 ignore 的
             rel_path = os.path.relpath(os.path.join(root, f), PROJECT_ROOT)
             meta = FILE_META.get(rel_path, "")
             desc = f"  # {meta}" if meta else ""
             
             lines.append(f"{indent}    📄 {f}{desc}")
             
-    lines.append(f"{'='*30}\n\n")
+    lines.append(f"{'='*50}\n\n")
     return "\n".join(lines)
 
 def generate_context_dump(seq):
@@ -378,27 +376,27 @@ def generate_context_dump(seq):
         # Header
         outfile.write(f"# INVEST SYSTEM CONTEXT DUMP\n")
         outfile.write(f"# Date: {datetime.datetime.now()}\n")
-        outfile.write(f"# Note: This file contains both the project structure and full code content.\n\n")
+        outfile.write(f"# Security: Sensitive files (.env) and temp dirs are EXCLUDED.\n\n")
         
         # Part 1: Tree
         outfile.write(tree_str)
         
         # Part 2: Content
         outfile.write(f"💻 CODE CONTENT\n")
-        outfile.write(f"{'='*30}\n")
+        outfile.write(f"{'='*50}\n")
         
         file_count = 0
         for root, dirs, files in os.walk(PROJECT_ROOT):
             dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
             
             for f in sorted(files):
+                # 双重过滤：必须不在忽略列表 AND 必须在允许后缀列表
                 if f in IGNORE_FILES or not f.endswith(INCLUDE_EXTENSIONS):
                     continue
                 
                 abs_path = os.path.join(root, f)
                 rel_path = os.path.relpath(abs_path, PROJECT_ROOT)
                 
-                # 分隔符：让 AI 容易识别文件边界
                 outfile.write(f"\n{'-'*60}\n")
                 outfile.write(f"FILE PATH: {rel_path}\n")
                 outfile.write(f"{'-'*60}\n")
@@ -407,13 +405,13 @@ def generate_context_dump(seq):
                     with open(abs_path, 'r', encoding='utf-8') as infile:
                         content = infile.read()
                         outfile.write(content)
-                        outfile.write("\n") # 确保文件末尾有换行
+                        outfile.write("\n")
                         file_count += 1
                 except Exception as e:
                     outfile.write(f"[Error reading file: {e}]\n")
 
-    print(f"✅ 上下文快照已生成: note/{filename}")
-    print(f"📊 包含目录结构 + {file_count} 个核心代码文件")
+    print(f"✅ 安全上下文快照已生成: note/{filename}")
+    print(f"🛡️ 已屏蔽 .env 及临时目录 | 包含 {file_count} 个核心文件")
 
 if __name__ == "__main__":
     seq_str = get_today_seq()
