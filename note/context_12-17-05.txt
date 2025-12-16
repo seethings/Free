@@ -1,0 +1,1176 @@
+# INVEST SYSTEM CONTEXT DUMP
+# Date: 2025-12-17 00:11:15.797790
+# Security: Sensitive files (.env) and temp dirs are EXCLUDED.
+
+📦 PROJECT STRUCTURE (Ignored: .env, temp/, note/, data/)
+==================================================
+📂 ROOT/
+    📄 .gitignore  # Git忽略规则 [核心]
+    📄 requirements.txt  # Python依赖清单 [核心]
+    📂 ui/
+    📂 database/
+        📄 models.py  # SQLAlchemy数据库模型(ODS/DWS) [核心]
+    📂 interface/
+        📄 tushare_client.py  # Tushare接口封装(带重试) [核心]
+    📂 tools/
+        📄 db_inspector.py  # 数据库体检工具 [工具]
+        📄 debug_finance.py
+        📄 doc_generator.py  # 上下文生成工具 [工具]
+        📄 git_auto.py
+    📂 core/
+        📄 config.py  # 全局配置加载器 [核心]
+        📄 mapping.py  # 中英文映射字典 [核心]
+    📂 engine/
+        📄 updater.py  # 数据更新引擎 [核心]
+==================================================
+
+💻 CODE CONTENT
+==================================================
+
+------------------------------------------------------------
+FILE PATH: .gitignore
+------------------------------------------------------------
+# System
+.DS_Store
+*.log
+__pycache__/
+
+# Python
+venv/
+*.pyc
+
+# Configuration & Secrets (绝对不能上传!)
+.env
+core/__pycache__
+
+# IDE
+.vscode/
+.idea/
+
+# Data (可选，如果不想上传临时下载的数据)
+data/*
+!data/.gitkeep
+
+------------------------------------------------------------
+FILE PATH: requirements.txt
+------------------------------------------------------------
+# Data Source
+tushare>=1.2.89
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Database (PostgreSQL + SQLAlchemy 2.0)
+SQLAlchemy>=2.0.0
+psycopg2-binary>=2.9.0
+
+# UI Framework
+nicegui>=1.4.0
+
+# Utilities
+python-dotenv>=1.0.0
+pyyaml>=6.0
+
+
+------------------------------------------------------------
+FILE PATH: database/models.py
+------------------------------------------------------------
+from sqlalchemy import Column, String, Float, Boolean, DateTime, Integer, Text, PrimaryKeyConstraint
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
+from sqlalchemy import create_engine
+from datetime import datetime
+from core.config import settings
+
+# 1. 数据库连接引擎
+engine = create_engine(settings.DB_URL)
+
+# 2. 会话工厂 (这就是报错缺失的部分)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+class Base(DeclarativeBase):
+    pass
+
+# --- Meta Data Layer (基础信息) ---
+
+class StockBasic(Base):
+    """
+    股票基础信息表 (PRD 4.1)
+    """
+    __tablename__ = "stock_basic"
+
+    ts_code = Column(String(20), primary_key=True, comment="TS代码")
+    symbol = Column(String(20), comment="股票代码")
+    name = Column(String(50), comment="股票名称")
+    area = Column(String(50), comment="地域")
+    industry = Column(String(50), comment="所属行业")
+    market = Column(String(50), comment="市场类型")
+    list_date = Column(String(8), comment="上市日期")
+    
+    # 核心字段: 标记是否为中证800 (PRD 1.2)
+    is_csi800 = Column(Boolean, default=False, index=True, comment="是否中证800")
+
+class Watchlist(Base):
+    """
+    用户自选股池 (PRD 1.2)
+    """
+    __tablename__ = "watchlist"
+
+    ts_code = Column(String(20), primary_key=True)
+    name = Column(String(50))
+    industry = Column(String(50))
+    weight = Column(Float, default=1.0, comment="权重")
+    add_time = Column(DateTime, default=datetime.now)
+
+# --- ODS Layer (原始数据层 - Store Everything) ---
+
+class ODSMarketDaily(Base):
+    """
+    日线行情 (PRD 2.1)
+    """
+    __tablename__ = "ods_market_daily"
+
+    ts_code = Column(String(20), primary_key=True)
+    trade_date = Column(String(8), primary_key=True, index=True)
+    open = Column(Float)
+    high = Column(Float)
+    low = Column(Float)
+    close = Column(Float)
+    pre_close = Column(Float)
+    change = Column(Float)
+    pct_chg = Column(Float)
+    vol = Column(Float, comment="成交量(手)")
+    amount = Column(Float, comment="成交额(千元)")
+
+class ODSAdjFactor(Base):
+    """
+    复权因子 (PRD 2.1)
+    """
+    __tablename__ = "ods_adj_factor"
+
+    ts_code = Column(String(20), primary_key=True)
+    trade_date = Column(String(8), primary_key=True)
+    adj_factor = Column(Float)
+
+class ODSFinanceReport(Base):
+    """
+    通用财务报表存储 (PRD 4.2)
+    策略: JSONB 宽表模式
+    """
+    __tablename__ = "ods_finance_report"
+
+    # 复合主键
+    ts_code = Column(String(20), primary_key=True)
+    end_date = Column(String(8), primary_key=True, comment="报告期")
+    report_type = Column(String(10), primary_key=True, comment="报表类型")
+    update_flag = Column(String(5), primary_key=True, default='0', comment="更新标记")
+    
+    ann_date = Column(String(8), comment="公告日期")
+    
+    # 核心字段
+    data = Column(JSONB, comment="原始财务数据JSON")
+    category = Column(String(20), index=True, comment="报表类别")
+
+# --- DWS Layer (标准服务层 - Strict Logic) ---
+
+class DWSMarketIndicators(Base):
+    """
+    市场衍生指标表 (PRD 2.2)
+    包含: 复权后均线, PE/PB/市值
+    """
+    __tablename__ = "dws_market_indicators"
+
+    ts_code = Column(String(20), primary_key=True)
+    trade_date = Column(String(8), primary_key=True, index=True)
+    
+    # 基础指标 (来自 daily_basic)
+    pe_ttm = Column(Float, comment="PE(TTM)")
+    pb = Column(Float, comment="市净率")
+    total_mv = Column(Float, comment="总市值")
+    turnover_rate = Column(Float, comment="换手率")
+    
+    # 计算指标 (基于 QFQ)
+    close_qfq = Column(Float, comment="前复权收盘价")
+    ma_20 = Column(Float, comment="20日均线")
+    ma_50 = Column(Float, comment="50日均线")
+    ma_120 = Column(Float, comment="120日均线")
+    ma_250 = Column(Float, comment="250日均线 (年线)")
+    # PRD 3.1 容错: 行数<850时，ma_850为NULL
+    ma_850 = Column(Float, comment="850日均线 (三年线)")
+
+class DWSFinanceStd(Base):
+    """
+    标准化财务宽表 (PRD 2.2)
+    逻辑: 仅存储 report_type='1' (合并报表) 的清洗后数据
+    """
+    __tablename__ = "dws_finance_std"
+
+    ts_code = Column(String(20), primary_key=True)
+    end_date = Column(String(8), primary_key=True, index=True, comment="报告期")
+    ann_date = Column(String(8), comment="公告日期")
+    
+    # 核心字段 (映射自 Mapping)
+    revenue = Column(Float, comment="营业收入")
+    n_income_attr_p = Column(Float, comment="归母净利润")
+    n_cashflow_act = Column(Float, comment="经营现金流")
+    debt_to_assets = Column(Float, comment="资产负债率")
+    roe = Column(Float, comment="ROE")
+    grossprofit_margin = Column(Float, comment="毛利率")
+
+# --- 工具函数 ---
+def init_db():
+    """初始化数据库表结构"""
+    Base.metadata.create_all(bind=engine)
+
+------------------------------------------------------------
+FILE PATH: interface/tushare_client.py
+------------------------------------------------------------
+import tushare as ts
+import pandas as pd
+import time
+from core.config import settings
+from functools import wraps
+
+class TushareClient:
+    def __init__(self):
+        if not settings.TS_TOKEN:
+            raise ValueError("Tushare Token is missing in settings")
+        
+        # 初始化 Pro 接口 (PRD 1.1)
+        self.pro = ts.pro_api(settings.TS_TOKEN)
+        print(f"📡 Tushare Client Initialized. Token: {settings.TS_TOKEN[:5]}***")
+
+    def retry_policy(func):
+        """
+        装饰器: Tushare 官方建议的重试机制
+        Ref: Tushare PDF [cite: 18]
+        """
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            max_retries = 3
+            for i in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    print(f"⚠️ API Warning: {e}, Retrying ({i+1}/{max_retries})...")
+                    time.sleep(1)
+            raise Exception(f"❌ API Failed after {max_retries} retries.")
+        return wrapper
+
+    # --- 1. 基础数据 ---
+    
+    @retry_policy
+    def fetch_stock_basic(self):
+        """获取全市场股票列表 (PRD 2.1)"""
+        fields = 'ts_code,symbol,name,area,industry,market,list_date'
+        return self.pro.stock_basic(exchange='', list_status='L', fields=fields)
+
+    # --- 2. 市场行情 (Column Storage) ---
+
+    @retry_policy
+    def fetch_daily(self, ts_code=None, trade_date=None, start_date=None, end_date=None):
+        """
+        日线行情
+        Ref: Tushare PDF Daily Interface [cite: 252]
+        """
+        return self.pro.daily(ts_code=ts_code, trade_date=trade_date, 
+                              start_date=start_date, end_date=end_date)
+
+    @retry_policy
+    def fetch_adj_factor(self, ts_code=None, trade_date=None, start_date=None, end_date=None):
+        """复权因子"""
+        return self.pro.adj_factor(ts_code=ts_code, trade_date=trade_date, 
+                                   start_date=start_date, end_date=end_date)
+
+    # --- 3. 财务数据 (JSONB Storage) ---
+    # PRD 要求: Store Everything, JSONB 宽表模式
+    # 关键点: 必须获取 update_flag 以区分修正报表 
+
+    def _fetch_financial(self, api_func, ts_code, start_date, end_date):
+        """通用财报获取逻辑"""
+        # 强制指定字段，确保 update_flag 存在
+        fields = 'ts_code,ann_date,f_ann_date,end_date,report_type,comp_type,update_flag'
+        
+        # 注意: Tushare 的财报接口字段非常多，这里我们不枚举所有 metrics，
+        # 而是依赖 Tushare 默认返回 (API 会返回该报表的所有字段)，
+        # 我们只显式确保 meta 字段存在。
+        # 实际上，如果不传 fields，Tushare 默认返回所有字段，这正符合我们 JSONB 全量存储的需求。
+        # 但为了稳健，我们在外部调用时如果不传 fields，它就是全量的。
+        
+        return api_func(ts_code=ts_code, start_date=start_date, end_date=end_date)
+
+    @retry_policy
+    def fetch_income(self, ts_code, start_date, end_date):
+        """利润表"""
+        return self.pro.income(ts_code=ts_code, start_date=start_date, end_date=end_date)
+
+    @retry_policy
+    def fetch_balancesheet(self, ts_code, start_date, end_date):
+        """资产负债表"""
+        return self.pro.balancesheet(ts_code=ts_code, start_date=start_date, end_date=end_date)
+
+    @retry_policy
+    def fetch_cashflow(self, ts_code, start_date, end_date):
+        """现金流量表"""
+        return self.pro.cashflow(ts_code=ts_code, start_date=start_date, end_date=end_date)
+
+    @retry_policy
+    def fetch_fina_indicator(self, ts_code, start_date, end_date):
+        """财务指标表"""
+        return self.pro.fina_indicator(ts_code=ts_code, start_date=start_date, end_date=end_date)
+
+# 单例模式
+ts_client = TushareClient()
+
+------------------------------------------------------------
+FILE PATH: tools/db_inspector.py
+------------------------------------------------------------
+import sys
+import os
+import pandas as pd
+from sqlalchemy import text, func
+from datetime import datetime
+
+# 添加项目根目录到路径
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from database.models import SessionLocal, StockBasic, ODSMarketDaily, ODSFinanceReport, DWSMarketIndicators, DWSFinanceStd
+from core.config import settings
+
+class DBInspector:
+    def __init__(self):
+        self.db = SessionLocal()
+        print(f"\n🩺 === Invest System DB Inspector V1.1 ===")
+        print(f"📅 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("="*50)
+
+    def check_counts(self):
+        """基础计数检查"""
+        print("\n[1. Base Counts]")
+        
+        counts = {
+            "Stocks (Total)": self.db.query(StockBasic).count(),
+            "ODS Daily Rows": self.db.query(ODSMarketDaily).count(),
+            "ODS Finance Rows": self.db.query(ODSFinanceReport).count(), # 新增
+            "DWS Market Rows": self.db.query(DWSMarketIndicators).count(),
+            "DWS Finance Rows": self.db.query(DWSFinanceStd).count()
+        }
+        
+        for k, v in counts.items():
+            print(f"  - {k:<20}: {v}")
+
+    def inspect_finance_health(self):
+        """财务数据深度检查"""
+        print("\n[2. Finance Data Health]")
+        
+        # 1. 检查 Report Type 分布
+        # 这能帮我们确认 Tushare 返回的是字符串 '1' 还是数字 1
+        results = self.db.query(
+            ODSFinanceReport.report_type, 
+            func.count(ODSFinanceReport.ts_code)
+        ).group_by(ODSFinanceReport.report_type).all()
+        
+        if not results:
+            print("  ⚠️ ODS Finance is EMPTY! (Fetch failed)")
+        else:
+            print(f"  Report Type Dist: {dict(results)}")
+            
+        # 2. 检查 JSON 结构采样
+        if results:
+            sample = self.db.query(ODSFinanceReport).first()
+            print(f"  Sample Keys (Top 5): {list(sample.data.keys())[:5]}")
+            print(f"  Sample Category: {sample.category}")
+
+    def inspect_market_integrity(self, check_date=None):
+        print("\n[3. Market Integrity]")
+        if not check_date:
+            latest = self.db.execute(text("SELECT MAX(trade_date) FROM ods_market_daily")).scalar()
+            check_date = latest
+        
+        if check_date:
+            ods_count = self.db.query(ODSMarketDaily).filter(ODSMarketDaily.trade_date == check_date).count()
+            dws_ma_count = self.db.execute(text(f"SELECT count(*) FROM dws_market_indicators WHERE trade_date = '{check_date}' AND ma_20 IS NOT NULL")).scalar()
+            print(f"  Date: {check_date} | ODS: {ods_count} | DWS(MA): {dws_ma_count}")
+        else:
+            print("  ⚠️ No market data.")
+
+    def close(self):
+        self.db.close()
+
+if __name__ == "__main__":
+    inspector = DBInspector()
+    try:
+        inspector.check_counts()
+        inspector.inspect_finance_health() # 新增检查
+        inspector.inspect_market_integrity()
+    except Exception as e:
+        print(f"❌ Inspection Failed: {e}")
+    finally:
+        inspector.close()
+    print("\n" + "="*50)
+
+------------------------------------------------------------
+FILE PATH: tools/debug_finance.py
+------------------------------------------------------------
+import sys
+import os
+import pandas as pd
+
+# Path setup
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from interface.tushare_client import ts_client
+
+def debug_finance_fetch():
+    print("🕵️‍♂️ === Tushare Finance API Probe ===")
+    ts_code = '600000.SH'
+    start_date = '20230101'
+    end_date = '20240101'
+    
+    print(f"Target: {ts_code} | Range: {start_date} - {end_date}")
+    
+    try:
+        # 1. 直接调用 Client 封装的方法
+        print("\n[Attempt 1] Calling fetch_income...")
+        df = ts_client.fetch_income(ts_code=ts_code, start_date=start_date, end_date=end_date)
+        
+        if df is None:
+            print("❌ Result is None!")
+        elif df.empty:
+            print("⚠️ Result is Empty DataFrame!")
+        else:
+            print(f"✅ Success! Rows fetched: {len(df)}")
+            print("Columns:", df.columns.tolist())
+            print("Sample Row 1:\n", df.iloc[0].to_dict())
+            
+            # 检查关键字段
+            if 'update_flag' in df.columns:
+                print(f"update_flag found: {df['update_flag'].unique()}")
+            else:
+                print("⚠️ Warning: 'update_flag' MISSING in response!")
+
+    except Exception as e:
+        print(f"❌ API Call Failed: {e}")
+
+if __name__ == "__main__":
+    debug_finance_fetch()
+
+------------------------------------------------------------
+FILE PATH: tools/doc_generator.py
+------------------------------------------------------------
+import os
+import datetime
+
+# --- 配置区域 ---
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'note')
+
+# 1. 忽略目录 (新增/确认: temp, note, venv, data)
+IGNORE_DIRS = {
+    'venv', '__pycache__', '.git', '.idea', '.vscode', 
+    'data', 'temp', 'note', 'dist', 'build', 'logs'
+}
+
+# 2. 忽略文件 (新增: .env 绝对不能上传!)
+IGNORE_FILES = {
+    '.DS_Store', 'poetry.lock', 'package-lock.json', 'LICENSE', 
+    '.env', 'requirements.txt.bak'
+}
+
+# 3. 允许读取后缀 (移除 .env)
+INCLUDE_EXTENSIONS = ('.py', '.txt', '.md', '.gitignore', '.ini', '.yaml', '.yml', '.sh', '.json')
+
+# 文件注释字典 (辅助 AI 理解文件用途)
+FILE_META = {
+    "requirements.txt": "Python依赖清单 [核心]",
+    # ".env": "环境变量/密钥 [核心]", # 已从生成列表中移除
+    ".gitignore": "Git忽略规则 [核心]",
+    "core/config.py": "全局配置加载器 [核心]",
+    "core/mapping.py": "中英文映射字典 [核心]",
+    "database/models.py": "SQLAlchemy数据库模型(ODS/DWS) [核心]",
+    "interface/tushare_client.py": "Tushare接口封装(带重试) [核心]",
+    "engine/updater.py": "数据更新引擎 [核心]",
+    "tools/doc_generator.py": "上下文生成工具 [工具]",
+    "tools/db_inspector.py": "数据库体检工具 [工具]",
+}
+
+def get_today_seq():
+    """生成 mm-dd-NN 格式的编号"""
+    today = datetime.datetime.now().strftime("%m-%d")
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
+    
+    max_seq = 0
+    for f in os.listdir(OUTPUT_DIR):
+        if f.startswith(f"context_{today}"):
+            try:
+                parts = f.split('.')[0].split('-')
+                seq = int(parts[-1])
+                if seq > max_seq:
+                    max_seq = seq
+            except:
+                pass
+    return f"{today}-{max_seq + 1:02d}"
+
+def get_tree_str():
+    """生成目录树字符串"""
+    lines = []
+    lines.append(f"📦 PROJECT STRUCTURE (Ignored: .env, temp/, note/, data/)")
+    lines.append(f"{'='*50}")
+    
+    for root, dirs, files in os.walk(PROJECT_ROOT):
+        # 过滤目录
+        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+        
+        level = root.replace(PROJECT_ROOT, '').count(os.sep)
+        indent = ' ' * 4 * level
+        folder_name = os.path.basename(root)
+        if folder_name == os.path.basename(PROJECT_ROOT):
+            folder_name = "ROOT"
+            
+        lines.append(f"{indent}📂 {folder_name}/")
+        
+        for f in sorted(files):
+            # 严格过滤忽略文件
+            if f in IGNORE_FILES:
+                continue
+            
+            # 只有在白名单后缀里的文件才显示在树中，或者特定的配置文件
+            # 这里稍微放宽一点，让树结构完整些，但排除明确 ignore 的
+            rel_path = os.path.relpath(os.path.join(root, f), PROJECT_ROOT)
+            meta = FILE_META.get(rel_path, "")
+            desc = f"  # {meta}" if meta else ""
+            
+            lines.append(f"{indent}    📄 {f}{desc}")
+            
+    lines.append(f"{'='*50}\n\n")
+    return "\n".join(lines)
+
+def generate_context_dump(seq):
+    """生成单一整合文件"""
+    filename = f"context_{seq}.txt"
+    filepath = os.path.join(OUTPUT_DIR, filename)
+    
+    tree_str = get_tree_str()
+    
+    with open(filepath, 'w', encoding='utf-8') as outfile:
+        # Header
+        outfile.write(f"# INVEST SYSTEM CONTEXT DUMP\n")
+        outfile.write(f"# Date: {datetime.datetime.now()}\n")
+        outfile.write(f"# Security: Sensitive files (.env) and temp dirs are EXCLUDED.\n\n")
+        
+        # Part 1: Tree
+        outfile.write(tree_str)
+        
+        # Part 2: Content
+        outfile.write(f"💻 CODE CONTENT\n")
+        outfile.write(f"{'='*50}\n")
+        
+        file_count = 0
+        for root, dirs, files in os.walk(PROJECT_ROOT):
+            dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+            
+            for f in sorted(files):
+                # 双重过滤：必须不在忽略列表 AND 必须在允许后缀列表
+                if f in IGNORE_FILES or not f.endswith(INCLUDE_EXTENSIONS):
+                    continue
+                
+                abs_path = os.path.join(root, f)
+                rel_path = os.path.relpath(abs_path, PROJECT_ROOT)
+                
+                outfile.write(f"\n{'-'*60}\n")
+                outfile.write(f"FILE PATH: {rel_path}\n")
+                outfile.write(f"{'-'*60}\n")
+                
+                try:
+                    with open(abs_path, 'r', encoding='utf-8') as infile:
+                        content = infile.read()
+                        outfile.write(content)
+                        outfile.write("\n")
+                        file_count += 1
+                except Exception as e:
+                    outfile.write(f"[Error reading file: {e}]\n")
+
+    print(f"✅ 安全上下文快照已生成: note/{filename}")
+    print(f"🛡️ 已屏蔽 .env 及临时目录 | 包含 {file_count} 个核心文件")
+
+if __name__ == "__main__":
+    seq_str = get_today_seq()
+    generate_context_dump(seq_str)
+
+------------------------------------------------------------
+FILE PATH: tools/git_auto.py
+------------------------------------------------------------
+import os
+import sys
+import subprocess
+from datetime import datetime
+
+# --- 配置 ---
+BRANCH = "main"
+DOC_GEN_SCRIPT = "tools/doc_generator.py"
+
+def run_cmd(cmd, desc, ignore_error=False):
+    """执行系统命令"""
+    try:
+        # capture_output=False 让命令输出直接显示在屏幕上
+        result = subprocess.run(cmd, shell=True, check=True, text=True, capture_output=False)
+        return True
+    except subprocess.CalledProcessError as e:
+        if not ignore_error:
+            print(f"❌ 执行失败 [{desc}]: {e}")
+        return False
+
+def get_cmd_output(cmd):
+    """获取命令返回的文本 (静默执行)"""
+    try:
+        result = subprocess.run(cmd, shell=True, check=True, text=True, capture_output=True)
+        return result.stdout.strip()
+    except subprocess.CalledProcessError:
+        return ""
+
+def auto_save():
+    """功能 1: 保存进度"""
+    print("\n💾 --- 正在保存进度 ---")
+    
+    # 1. 生成快照
+    if os.path.exists(DOC_GEN_SCRIPT):
+        print("1️⃣ 更新 AI 上下文快照...")
+        run_cmd(f"python3 {DOC_GEN_SCRIPT}", "生成文档", ignore_error=True)
+    
+    # 2. Add
+    run_cmd("git add .", "添加文件(git add)")
+    
+    # 3. Commit 前的检查
+    status_short = get_cmd_output("git status --short")
+    if not status_short:
+        print("⚠️ 当前没有文件变动，无需提交。")
+        # 即使没有变动，如果云端滞后，用户可能只想 push，所以不直接 return
+        # 但通常 save 是为了存新东西。这里我们继续走，方便单纯的 push 操作。
+    else:
+        print("\n📝 检测到以下文件变动：")
+        print("-" * 30)
+        print(status_short)
+        print("-" * 30)
+
+        # 4. 获取备注
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M')
+        default_msg = f"自动存档: {timestamp}"
+        
+        print(f"💡 提示：输入具体修改内容可方便日后回溯")
+        user_msg = input(f"✍️ 提交备注 (直接回车 = '{default_msg}'): ").strip()
+        commit_msg = user_msg if user_msg else default_msg
+        
+        # 5. 执行提交
+        run_cmd(f'git commit -m "{commit_msg}"', "提交代码(git commit)")
+    
+    # 6. Push
+    print("☁️ 同步到 GitHub...")
+    if run_cmd(f"git push origin {BRANCH}", "推送到云端(git push)", ignore_error=True):
+        print(f"✅ 保存成功！")
+    else:
+        print("⚠️ 普通推送失败！这通常是因为你回滚过版本。")
+        print("💡 建议：请尝试使用主菜单的 [4] 强制同步。")
+
+def show_history():
+    """功能 2: 查看历史"""
+    print("\n📜 --- 最近 10 次存档记录 ---")
+    cmd = 'git log -n 10 --pretty=format:"%C(yellow)%h%Creset | %C(cyan)%cd%Creset | %s" --date=format:"%m-%d %H:%M"'
+    os.system(cmd) 
+    print("\n")
+
+def time_travel():
+    """功能 3: 时光倒流"""
+    print("\n⏳ --- 时光倒流 (危险区) ---")
+    print("此功能可以将项目重置到过去的状态。")
+    
+    confirm = input("确定要回滚吗？(输入 y 确认): ").lower()
+    if confirm != 'y':
+        return
+
+    timestamp_str = datetime.now().strftime('%m%d_%H%M%S')
+    broken_branch = f"backup/mess_{timestamp_str}"
+    
+    print(f"\n🛡️ 正在创建救援备份分支: {broken_branch} ...")
+    run_cmd("git add .", "备份当前状态")
+    
+    backup_msg = f"[系统] 重置前自动备份 (时间: {datetime.now().strftime('%H:%M:%S')})"
+    run_cmd(f'git commit -m "{backup_msg}"', "提交备份", ignore_error=True)
+    
+    run_cmd(f"git branch {broken_branch}", "创建备份分支")
+    print(f"✅ 当前状态已安全保存在分支 [{broken_branch}]。")
+
+    show_history()
+    target_hash = input("\n🎯 请输入你要回到的那个 [Hash码] (例如 a1b2c3d): ").strip()
+    
+    if not target_hash:
+        print("❌ 未输入 Hash，操作取消。")
+        return
+
+    print(f"\n🚀 正在穿越回 {target_hash} ...")
+    if run_cmd(f"git reset --hard {target_hash}", "硬重置(Hard Reset)"):
+        print(f"\n✅ 穿越成功！")
+        print("⚠️ 注意：你需要使用主菜单的 [4] 强制同步 才能把这个变更推送到云端。")
+
+def force_sync():
+    """功能 4: 强制同步 (新增)"""
+    print("\n☢️ --- 暴力同步 (强制覆盖云端) ---")
+    print("⚠️ 警告：这会强制将 GitHub 上的代码替换为你现在本地的样子。")
+    print("⚠️ 适用场景：当你执行过 [时光倒流] 后，普通保存报错时。")
+    
+    confirm = input("❓ 确定要执行吗？(输入 yes 确认): ").strip()
+    if confirm != "yes":
+        print("已取消。")
+        return
+
+    print(f"🚀 正在强制推送 (Force Push) 到 {BRANCH} 分支...")
+    if run_cmd(f"git push -f origin {BRANCH}", "强制推送"):
+        print("\n✅ 云端已强制同步！现在 GitHub 和你本地完全一致了。")
+
+def main_menu():
+    while True:
+        print("\n🤖 === Git 智能助理 (Invest System) ===")
+        print("1. 💾 保存进度 (Save)  -> 日常使用")
+        print("2. 📜 查看历史 (Log)   -> 看看干了啥")
+        print("3. 🔙 时光倒流 (Reset) -> 救命用的")
+        print("4. ☢️ 强制同步 (Force) -> 专治报错")
+        print("0. 🚪 退出 (Exit)")
+        
+        choice = input("👉 请选择: ").strip()
+        
+        if choice == '1':
+            auto_save()
+        elif choice == '2':
+            show_history()
+        elif choice == '3':
+            time_travel()
+        elif choice == '4':
+            force_sync()
+        elif choice == '0':
+            print("Bye! 👋")
+            break
+        else:
+            print("无效选项")
+
+if __name__ == "__main__":
+    if not os.path.exists(".gitignore"):
+        print("⚠️ 错误：请在项目根目录下运行此脚本！")
+    else:
+        main_menu()
+
+------------------------------------------------------------
+FILE PATH: core/config.py
+------------------------------------------------------------
+import os
+from dotenv import load_dotenv
+
+# 加载 .env 文件
+load_dotenv()
+
+class Config:
+    # 基础鉴权
+    TS_TOKEN = os.getenv("TS_TOKEN")
+    DB_URL = os.getenv("DB_URL")
+    
+    # 系统常量 (PRD 1.3)
+    START_DATE = "20150101"
+    
+    # 完整性检查
+    if not TS_TOKEN:
+        raise ValueError("❌ 错误: 未在 .env 中找到 TS_TOKEN，请检查配置文件。")
+    if not DB_URL:
+        raise ValueError("❌ 错误: 未在 .env 中找到 DB_URL，请检查配置文件。")
+
+settings = Config()
+
+------------------------------------------------------------
+FILE PATH: core/mapping.py
+------------------------------------------------------------
+# 字段映射字典 (Key: DB/API Field, Value: Chinese Name)
+# Ref: Tushare Pro 字段字典
+
+FIELD_MAPPING = {
+    # --- 基础信息 ---
+    "ts_code": "TS代码",
+    "symbol": "股票代码",
+    "name": "股票名称",
+    "industry": "行业",
+    "area": "地域",
+    "list_date": "上市日期",
+    "is_csi800": "中证800",
+
+    # --- 日线行情 (Daily) ---
+    "trade_date": "交易日期",
+    "open": "开盘价",
+    "high": "最高价",
+    "low": "最低价",
+    "close": "收盘价",
+    "pre_close": "昨收价",
+    "change": "涨跌额",
+    "pct_chg": "涨跌幅(%)",
+    "vol": "成交量(手)",
+    "amount": "成交额(千元)",
+    "turnover_rate": "换手率(%)",
+    "pe_ttm": "市盈率(TTM)",
+    "pb": "市净率",
+    "total_mv": "总市值(万)",
+    "circ_mv": "流通市值(万)",
+
+    # --- 财务核心指标 (Indicator/Income/Cashflow) ---
+    "end_date": "报告期",
+    "ann_date": "公告日期",
+    "report_type": "报表类型",
+    
+    # 利润表 (Income) [cite: 526]
+    "total_revenue": "营业总收入",
+    "revenue": "营业收入",
+    "n_income_attr_p": "归母净利润",  # 核心字段
+    "operate_profit": "营业利润",
+    
+    # 资产负债表 (Balance Sheet) [cite: 549]
+    "total_assets": "资产总计",
+    "total_liab": "负债合计",
+    "total_hldr_eqy_exc_min_int": "股东权益合计(不含少数股东)", # 归母权益
+    "money_cap": "货币资金",
+    
+    # 现金流量表 (Cashflow) [cite: 587]
+    "n_cashflow_act": "经营活动现金净流量",
+    "n_cashflow_inv_act": "投资活动现金净流量",
+    "n_cashflow_fnc_act": "筹资活动现金净流量",
+
+    # 财务指标 (Indicator) [cite: 648]
+    "roe": "ROE",
+    "roe_dt": "ROE(扣非)",
+    "grossprofit_margin": "毛利率",
+    "netprofit_margin": "净利率",
+    "debt_to_assets": "资产负债率",
+    "current_ratio": "流动比率",
+}
+
+------------------------------------------------------------
+FILE PATH: engine/updater.py
+------------------------------------------------------------
+import pandas as pd
+from sqlalchemy.dialects.postgresql import insert
+from interface.tushare_client import ts_client
+from database.models import SessionLocal, StockBasic, ODSMarketDaily, ODSAdjFactor, ODSFinanceReport, DWSMarketIndicators, DWSFinanceStd
+from core.config import settings
+from datetime import datetime
+
+class DataUpdater:
+    def __init__(self):
+        self.db = SessionLocal()
+
+    def sync_stock_list(self):
+        """
+        全量同步股票列表，并标记中证800成分股 (PRD 3.1)
+        """
+        print("🔄 开始同步股票基础列表...")
+        
+        # 1. 拉取全市场股票 (Tushare API)
+        df_basics = ts_client.fetch_stock_basic()
+        if df_basics.empty:
+            print("⚠️ 未获取到股票列表，任务终止")
+            return
+
+        # 2. 拉取中证800成分股 (用于标记核心资产)
+        # 000906.SH 是中证800指数代码
+        # 注意: index_weight 接口需要 2000 积分 
+        try:
+            # 获取最新一个月的成分股（这里简化逻辑，取上个月的成分）
+            # 实际生产中可能需要动态计算日期，这里暂取最近的逻辑
+            # Tushare Pro 的 index_weight 通常按月更新
+            now_str = datetime.now().strftime("%Y%m%d")
+            # 尝试拉取最新的成分
+            df_csi800 = ts_client.pro.index_weight(index_code='000906.SH', start_date='20240101', end_date=now_str)
+            
+            # 如果没取到（比如年初还没更新），可以尝试取去年的，这里做简单容错
+            if df_csi800.empty:
+                 print("⚠️ 警告: 未获取到中证800成分股，将跳过标记步骤")
+                 csi800_set = set()
+            else:
+                 # 取最新日期的成分
+                 latest_date = df_csi800['trade_date'].max()
+                 df_latest = df_csi800[df_csi800['trade_date'] == latest_date]
+                 csi800_set = set(df_latest['con_code'].tolist())
+                 print(f"✅ 获取到中证800成分股 ({latest_date}): {len(csi800_set)} 只")
+
+        except Exception as e:
+            print(f"⚠️ 中证800接口调用失败: {e}")
+            csi800_set = set()
+
+        # 3. 数据处理与标记
+        # 默认全部 False
+        df_basics['is_csi800'] = False
+        # 如果代码在 csi800_set 中，设为 True
+        if csi800_set:
+            df_basics.loc[df_basics['ts_code'].isin(csi800_set), 'is_csi800'] = True
+
+        # 4. 写入数据库 (Upsert 模式)
+        # 使用 SQLAlchemy Core 的 bulk insert 效率较高，或者逐行 merge
+        # 这里为了演示清晰，使用 pandas to_sql 的替代方案或 ORM 循环
+        # 考虑到只有 5000 条数据，ORM 效率可接受
+        
+        count = 0
+        for _, row in df_basics.iterrows():
+            stock = StockBasic(
+                ts_code=row['ts_code'],
+                symbol=row['symbol'],
+                name=row['name'],
+                area=row['area'],
+                industry=row['industry'],
+                market=row['market'],
+                list_date=row['list_date'],
+                is_csi800=row['is_csi800']
+            )
+            self.db.merge(stock) # merge 会根据主键自动 insert 或 update
+            count += 1
+            
+        self.db.commit()
+        print(f"✅ 股票列表同步完成! 共处理: {count} 只, 其中中证800: {len(csi800_set)} 只")
+
+    def sync_daily_market(self, start_date: str, end_date: str):
+        """
+        S3 场景: 日线行情增量更新 (ODS层)
+        """
+        print(f"📈 开始同步日线行情 ({start_date} - {end_date})...")
+        
+        # 1. 获取日线 (全市场)
+        # 策略: 按日期循环拉取，每天约 5000 条，适合 WideCore 模式
+        # [cite_start]Tushare daily 接口支持单日全量 [cite: 1515]
+        
+        dates = pd.date_range(start=start_date, end=end_date).strftime('%Y%m%d').tolist()
+        
+        for trade_date in dates:
+            try:
+                # 1.1 拉取行情
+                df_daily = ts_client.fetch_daily(trade_date=trade_date)
+                if df_daily.empty:
+                    print(f"  - {trade_date}: 无数据 (休市?)")
+                    continue
+                
+                # 1.2 拉取复权因子
+                df_adj = ts_client.fetch_adj_factor(trade_date=trade_date)
+                
+                # 1.3 入库 ODSMarketDaily
+                # 使用 to_dict 转换，利用 SQLAlchemy 的 bulk_insert_mappings (需 Core 模式) 
+                # 或循环 ORM merge (简单但慢)。鉴于每日仅 5000 条，ORM merge 尚可，
+                # 但为性能推荐 bulk insert (这里简化演示使用 merge 逻辑的变体)
+                
+                daily_objs = []
+                for _, row in df_daily.iterrows():
+                    daily_objs.append({
+                        "ts_code": row['ts_code'],
+                        "trade_date": row['trade_date'],
+                        "open": row['open'],
+                        "high": row['high'],
+                        "low": row['low'],
+                        "close": row['close'],
+                        "pre_close": row['pre_close'],
+                        "change": row['change'],
+                        "pct_chg": row['pct_chg'],
+                        "vol": row['vol'],
+                        "amount": row['amount']
+                    })
+                
+                # 批量插入 (使用 Core 的 insert..on_conflict_do_update 会更优，这里用 ORM 逐个添加演示)
+                # 实际生产建议: self.db.execute(insert(ODSMarketDaily).values(daily_objs).on_conflict_do_nothing())
+                # 这里为了兼容性保持简单逻辑：
+                for obj in daily_objs:
+                    self.db.merge(ODSMarketDaily(**obj))
+                
+                # 1.4 入库 ODSAdjFactor
+                if not df_adj.empty:
+                    for _, row in df_adj.iterrows():
+                        self.db.merge(ODSAdjFactor(
+                            ts_code=row['ts_code'],
+                            trade_date=row['trade_date'],
+                            adj_factor=row['adj_factor']
+                        ))
+                
+                self.db.commit()
+                print(f"  ✅ {trade_date}: 行情入库完成 (Stocks: {len(df_daily)})")
+                
+            except Exception as e:
+                self.db.rollback()
+                print(f"  ❌ {trade_date}: 处理失败 - {e}")
+
+    def sync_financial_report(self, ts_code: str, start_date: str = None, end_date: str = None):
+        """
+        S2/S4 场景: 财报数据更新 (ODS层 - JSONB)
+        [FIXED V2]: 强力修复 NaN -> None，兼容 PostgreSQL JSONB
+        """
+        print(f"💰 开始同步财报: {ts_code}...")
+        
+        tasks = {
+            "income": (ts_client.fetch_income, "income"),
+            "balancesheet": (ts_client.fetch_balancesheet, "balance"),
+            "cashflow": (ts_client.fetch_cashflow, "cashflow"),
+            "fina_indicator": (ts_client.fetch_fina_indicator, "indicator")
+        }
+        
+        for name, (api_func, category) in tasks.items():
+            try:
+                # 1. 拉取数据
+                df = api_func(ts_code=ts_code, start_date=start_date, end_date=end_date)
+                if df.empty:
+                    continue
+                
+                # 2. [关键修复] 数据清洗
+                # 先转为 object 类型，防止 pandas 将 None 自动回滚为 NaN
+                # 然后将所有 NaN 替换为 None (JSON null)
+                df = df.astype(object).where(pd.notnull(df), None)
+                
+                # 3. 转换为字典列表
+                records = df.to_dict('records')
+                
+                # 4. 逐条入库 (Merge)
+                # 注意：这里使用 bulk_insert 会更快，但为了演示 update_flag 逻辑保持循环
+                # 生产环境建议优化为 bulk_insert_mappings
+                for record in records:
+                    pk_data = {
+                        "ts_code": record.get("ts_code"),
+                        "end_date": record.get("end_date"),
+                        "report_type": record.get("report_type", '1'), 
+                        "update_flag": record.get("update_flag", '0'),
+                        "ann_date": record.get("ann_date"),
+                        "category": category,
+                        "data": record # record 中的 NaN 现在是 None 了
+                    }
+                    
+                    self.db.merge(ODSFinanceReport(**pk_data))
+                
+                self.db.commit()
+                print(f"  - {name}: {len(records)} 条记录")
+                
+            except Exception as e:
+                self.db.rollback()
+                print(f"  ⚠️ {name} 同步失败: {e}")
+
+    def process_market_dws(self, ts_code: str):
+        """
+        DWS 核心逻辑: 计算复权价格与均线 (PRD 2.2)
+        触发时机: 单只股票 ODS 行情更新后
+        """
+        print(f"🧮 计算 DWS 指标: {ts_code}...")
+        
+        # 1. 读取 ODS 数据 (Raw Price + Adj Factor)
+        # 使用 pandas read_sql 简化处理
+        query_daily = f"SELECT * FROM ods_market_daily WHERE ts_code = '{ts_code}' ORDER BY trade_date"
+        query_adj = f"SELECT trade_date, adj_factor FROM ods_adj_factor WHERE ts_code = '{ts_code}' ORDER BY trade_date"
+        
+        df_daily = pd.read_sql(query_daily, self.db.bind)
+        df_adj = pd.read_sql(query_adj, self.db.bind)
+        
+        if df_daily.empty or df_adj.empty:
+            print("  ⚠️ 数据不足，跳过计算")
+            return
+
+        # 2. 合并复权因子
+        df = pd.merge(df_daily, df_adj, on='trade_date', how='left')
+        # 填充缺失因子 (向前填充)
+        df['adj_factor'] = df['adj_factor'].ffill()
+        
+        # 3. 计算前复权价格 (QFQ)
+        # 公式: P_qfq = P_raw * (Factor_curr / Factor_latest) 
+        latest_factor = df['adj_factor'].iloc[-1]
+        df['close_qfq'] = df['close'] * (df['adj_factor'] / latest_factor)
+        
+        # 4. 计算均线 (MA)
+        # PRD 2.2: MA20, MA50, MA120, MA250, MA850
+        ma_list = [20, 50, 120, 250, 850]
+        for ma in ma_list:
+            col_name = f'ma_{ma}'
+            # min_periods=ma 确保数据不够时为 NaN (None)
+            df[col_name] = df['close_qfq'].rolling(window=ma, min_periods=ma).mean()
+            
+        # 5. 准备入库数据 (DWSMarketIndicators)
+        dws_records = []
+        for _, row in df.iterrows():
+            # 基础指标转换
+            record = {
+                "ts_code": row['ts_code'],
+                "trade_date": row['trade_date'],
+                "close_qfq": row['close_qfq'],
+                "ma_20": row['ma_20'] if pd.notna(row['ma_20']) else None,
+                "ma_50": row['ma_50'] if pd.notna(row['ma_50']) else None,
+                "ma_120": row['ma_120'] if pd.notna(row['ma_120']) else None,
+                "ma_250": row['ma_250'] if pd.notna(row['ma_250']) else None,
+                "ma_850": row['ma_850'] if pd.notna(row['ma_850']) else None,
+                # 透传 ODS 基础字段 (用于雷达筛选)
+                "turnover_rate": None, # 需从 daily_basic 补充，此处暂留空或后续 Join
+                "pe_ttm": None,        # 同上
+                "pb": None,            # 同上
+                "total_mv": None       # 同上
+            }
+            dws_records.append(record)
+            
+        # 6. 批量入库 (Upsert)
+        for r in dws_records:
+            self.db.merge(DWSMarketIndicators(**r))
+            
+        self.db.commit()
+        print(f"  ✅ DWS 计算完成: {len(dws_records)} 条均线数据")
+
+    def process_finance_dws(self, ts_code: str):
+        """
+        DWS 核心逻辑: 标准化财务宽表清洗 (PRD 2.2)
+        规则: 仅提取 report_type='1' (合并报表)
+        """
+        print(f"🧹 清洗财务数据: {ts_code}...")
+        
+        # 1. 提取所有类型的 JSONB 数据
+        # 获取该股票所有 report_type='1' 的记录
+        reports = self.db.query(ODSFinanceReport).filter(
+            ODSFinanceReport.ts_code == ts_code,
+            ODSFinanceReport.report_type == '1'
+        ).all()
+        
+        # 按 end_date 聚合数据
+        # 结构: { '20231231': { 'revenue': 100, 'roe': 5... } }
+        merged_data = {}
+        
+        for r in reports:
+            if r.end_date not in merged_data:
+                merged_data[r.end_date] = {"ann_date": r.ann_date}
+            
+            # 将 JSONB 中的数据打平合并
+            # 映射关系参考 core/mapping.py
+            # 实际生产建议严格按 Mapping 提取，这里做自动映射
+            raw_dict = r.data
+            target_fields = [
+                'revenue', 'n_income_attr_p', 'n_cashflow_act', 
+                'debt_to_assets', 'roe', 'grossprofit_margin'
+            ]
+            
+            for field in target_fields:
+                if field in raw_dict:
+                    merged_data[r.end_date][field] = raw_dict[field]
+
+        # 2. 入库 DWSFinanceStd
+        for end_date, metrics in merged_data.items():
+            dws_obj = DWSFinanceStd(
+                ts_code=ts_code,
+                end_date=end_date,
+                ann_date=metrics.get('ann_date'),
+                revenue=metrics.get('revenue'),
+                n_income_attr_p=metrics.get('n_income_attr_p'),
+                n_cashflow_act=metrics.get('n_cashflow_act'),
+                debt_to_assets=metrics.get('debt_to_assets'),
+                roe=metrics.get('roe'),
+                grossprofit_margin=metrics.get('grossprofit_margin')
+            )
+            self.db.merge(dws_obj)
+            
+        self.db.commit()
+        print(f"  ✅ 财务清洗完成: {len(merged_data)} 个报告期")
+
+    def close(self):
+        self.db.close()
+
+# 快捷入口
+if __name__ == "__main__":
+    updater = DataUpdater()
+    updater.sync_stock_list()
+    updater.close()

@@ -94,6 +94,52 @@ class ODSFinanceReport(Base):
     data = Column(JSONB, comment="原始财务数据JSON")
     category = Column(String(20), index=True, comment="报表类别")
 
+# --- DWS Layer (标准服务层 - Strict Logic) ---
+
+class DWSMarketIndicators(Base):
+    """
+    市场衍生指标表 (PRD 2.2)
+    包含: 复权后均线, PE/PB/市值
+    """
+    __tablename__ = "dws_market_indicators"
+
+    ts_code = Column(String(20), primary_key=True)
+    trade_date = Column(String(8), primary_key=True, index=True)
+    
+    # 基础指标 (来自 daily_basic)
+    pe_ttm = Column(Float, comment="PE(TTM)")
+    pb = Column(Float, comment="市净率")
+    total_mv = Column(Float, comment="总市值")
+    turnover_rate = Column(Float, comment="换手率")
+    
+    # 计算指标 (基于 QFQ)
+    close_qfq = Column(Float, comment="前复权收盘价")
+    ma_20 = Column(Float, comment="20日均线")
+    ma_50 = Column(Float, comment="50日均线")
+    ma_120 = Column(Float, comment="120日均线")
+    ma_250 = Column(Float, comment="250日均线 (年线)")
+    # PRD 3.1 容错: 行数<850时，ma_850为NULL
+    ma_850 = Column(Float, comment="850日均线 (三年线)")
+
+class DWSFinanceStd(Base):
+    """
+    标准化财务宽表 (PRD 2.2)
+    逻辑: 仅存储 report_type='1' (合并报表) 的清洗后数据
+    """
+    __tablename__ = "dws_finance_std"
+
+    ts_code = Column(String(20), primary_key=True)
+    end_date = Column(String(8), primary_key=True, index=True, comment="报告期")
+    ann_date = Column(String(8), comment="公告日期")
+    
+    # 核心字段 (映射自 Mapping)
+    revenue = Column(Float, comment="营业收入")
+    n_income_attr_p = Column(Float, comment="归母净利润")
+    n_cashflow_act = Column(Float, comment="经营现金流")
+    debt_to_assets = Column(Float, comment="资产负债率")
+    roe = Column(Float, comment="ROE")
+    grossprofit_margin = Column(Float, comment="毛利率")
+
 # --- 工具函数 ---
 def init_db():
     """初始化数据库表结构"""
