@@ -1,65 +1,69 @@
 import pandas as pd
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import text
 from interface.tushare_client import ts_client
-from database.models import SessionLocal, StockBasic, ODSMarketDaily, ODSAdjFactor, ODSFinanceReport, DWSMarketIndicators, DWSFinanceStd
-from core.config import settings
-from datetime import datetime
+from database.models import (
+    SessionLocal, StockBasic, Watchlist, 
+    ODSMarketDaily, ODSAdjFactor, ODSFinanceReport, 
+    DWSMarketIndicators, DWSFinanceStd
+)
+from datetime import datetime, timedelta
+import time
 
 class DataUpdater:
     def __init__(self):
         self.db = SessionLocal()
 
+    def close(self):
+        self.db.close()
+
+    def _get_universe_pool(self) -> set:
+        """
+        [Core Filter] Get the set of TS_CODES for CSI800 + Watchlist.
+        PRD 1.2: Only maintain these stocks.
+        """
+        # 1. Get CSI800
+        csi800 = self.db.query(StockBasic.ts_code).filter(StockBasic.is_csi800 == True).all()
+        pool = {row.ts_code for row in csi800}
+        
+        # 2. Get Watchlist
+        watchlist = self.db.query(Watchlist.ts_code).all()
+        for row in watchlist:
+            pool.add(row.ts_code)
+            
+        print(f"🎯 Universe Pool Size: {len(pool)}")
+        return pool
+
     def sync_stock_list(self):
         """
-        全量同步股票列表，并标记中证800成分股 (PRD 3.1)
+        PRD 3.1: Update Stock List & CSI800 Marks
         """
-        print("🔄 开始同步股票基础列表...")
-        
-        # 1. 拉取全市场股票 (Tushare API)
+        print("🔄 Syncing Stock List...")
         df_basics = ts_client.fetch_stock_basic()
-        if df_basics.empty:
-            print("⚠️ 未获取到股票列表，任务终止")
-            return
+        if df_basics.empty: return
 
-        # 2. 拉取中证800成分股 (用于标记核心资产)
-        # 000906.SH 是中证800指数代码
-        # 注意: index_weight 接口需要 2000 积分 
+        # Mark CSI 800
         try:
-            # 获取最新一个月的成分股（这里简化逻辑，取上个月的成分）
-            # 实际生产中可能需要动态计算日期，这里暂取最近的逻辑
-            # Tushare Pro 的 index_weight 通常按月更新
             now_str = datetime.now().strftime("%Y%m%d")
-            # 尝试拉取最新的成分
+            # Pull index weights (requires 2000 points, verified)
             df_csi800 = ts_client.pro.index_weight(index_code='000906.SH', start_date='20240101', end_date=now_str)
             
-            # 如果没取到（比如年初还没更新），可以尝试取去年的，这里做简单容错
-            if df_csi800.empty:
-                 print("⚠️ 警告: 未获取到中证800成分股，将跳过标记步骤")
-                 csi800_set = set()
+            if not df_csi800.empty:
+                latest_date = df_csi800['trade_date'].max()
+                df_latest = df_csi800[df_csi800['trade_date'] == latest_date]
+                csi800_set = set(df_latest['con_code'].tolist())
             else:
-                 # 取最新日期的成分
-                 latest_date = df_csi800['trade_date'].max()
-                 df_latest = df_csi800[df_csi800['trade_date'] == latest_date]
-                 csi800_set = set(df_latest['con_code'].tolist())
-                 print(f"✅ 获取到中证800成分股 ({latest_date}): {len(csi800_set)} 只")
-
+                csi800_set = set()
+                print("⚠️ Warning: Could not fetch CSI800 constituents.")
         except Exception as e:
-            print(f"⚠️ 中证800接口调用失败: {e}")
+            print(f"⚠️ CSI800 Fetch Error: {e}")
             csi800_set = set()
 
-        # 3. 数据处理与标记
-        # 默认全部 False
+        # Processing
         df_basics['is_csi800'] = False
-        # 如果代码在 csi800_set 中，设为 True
         if csi800_set:
             df_basics.loc[df_basics['ts_code'].isin(csi800_set), 'is_csi800'] = True
 
-        # 4. 写入数据库 (Upsert 模式)
-        # 使用 SQLAlchemy Core 的 bulk insert 效率较高，或者逐行 merge
-        # 这里为了演示清晰，使用 pandas to_sql 的替代方案或 ORM 循环
-        # 考虑到只有 5000 条数据，ORM 效率可接受
-        
-        count = 0
+        # Upsert Logic
         for _, row in df_basics.iterrows():
             stock = StockBasic(
                 ts_code=row['ts_code'],
@@ -71,84 +75,76 @@ class DataUpdater:
                 list_date=row['list_date'],
                 is_csi800=row['is_csi800']
             )
-            self.db.merge(stock) # merge 会根据主键自动 insert 或 update
-            count += 1
-            
+            self.db.merge(stock)
+        
         self.db.commit()
-        print(f"✅ 股票列表同步完成! 共处理: {count} 只, 其中中证800: {len(csi800_set)} 只")
+        print(f"✅ Stock List Synced. CSI800 Count: {len(csi800_set)}")
 
     def sync_daily_market(self, start_date: str, end_date: str):
         """
-        S3 场景: 日线行情增量更新 (ODS层)
+        S3 Scenario: Wide Core Update (Funnel Mode)
+        Fetches ALL market data, filters for Universe, saves to ODS.
         """
-        print(f"📈 开始同步日线行情 ({start_date} - {end_date})...")
-        
-        # 1. 获取日线 (全市场)
-        # 策略: 按日期循环拉取，每天约 5000 条，适合 WideCore 模式
-        # [cite_start]Tushare daily 接口支持单日全量 [cite: 1515]
-        
+        print(f"📈 Syncing Market ({start_date} - {end_date})...")
+        universe = self._get_universe_pool()
+        if not universe:
+            print("⚠️ Universe is empty! Run sync_stock_list first or add to Watchlist.")
+            return
+
         dates = pd.date_range(start=start_date, end=end_date).strftime('%Y%m%d').tolist()
         
         for trade_date in dates:
             try:
-                # 1.1 拉取行情
+                # 1. Fetch Full Market (1 API Call)
                 df_daily = ts_client.fetch_daily(trade_date=trade_date)
-                if df_daily.empty:
-                    print(f"  - {trade_date}: 无数据 (休市?)")
-                    continue
-                
-                # 1.2 拉取复权因子
                 df_adj = ts_client.fetch_adj_factor(trade_date=trade_date)
                 
-                # 1.3 入库 ODSMarketDaily
-                # 使用 to_dict 转换，利用 SQLAlchemy 的 bulk_insert_mappings (需 Core 模式) 
-                # 或循环 ORM merge (简单但慢)。鉴于每日仅 5000 条，ORM merge 尚可，
-                # 但为性能推荐 bulk insert (这里简化演示使用 merge 逻辑的变体)
+                if df_daily.empty:
+                    print(f"  - {trade_date}: No Trading Data (Holiday?)")
+                    continue
+
+                # 2. THE FUNNEL: Filter by Universe
+                df_daily_filtered = df_daily[df_daily['ts_code'].isin(universe)]
                 
+                # 3. Save ODS Market
                 daily_objs = []
-                for _, row in df_daily.iterrows():
-                    daily_objs.append({
-                        "ts_code": row['ts_code'],
-                        "trade_date": row['trade_date'],
-                        "open": row['open'],
-                        "high": row['high'],
-                        "low": row['low'],
-                        "close": row['close'],
-                        "pre_close": row['pre_close'],
-                        "change": row['change'],
-                        "pct_chg": row['pct_chg'],
-                        "vol": row['vol'],
-                        "amount": row['amount']
-                    })
+                for _, row in df_daily_filtered.iterrows():
+                    daily_objs.append(ODSMarketDaily(
+                        ts_code=row['ts_code'],
+                        trade_date=row['trade_date'],
+                        open=row['open'], high=row['high'], low=row['low'], close=row['close'],
+                        pre_close=row['pre_close'], change=row['change'], pct_chg=row['pct_chg'],
+                        vol=row['vol'], amount=row['amount']
+                    ))
                 
-                # 批量插入 (使用 Core 的 insert..on_conflict_do_update 会更优，这里用 ORM 逐个添加演示)
-                # 实际生产建议: self.db.execute(insert(ODSMarketDaily).values(daily_objs).on_conflict_do_nothing())
-                # 这里为了兼容性保持简单逻辑：
+                # Bulk save is safer for memory, but merge is fine for <1000 rows
                 for obj in daily_objs:
-                    self.db.merge(ODSMarketDaily(**obj))
-                
-                # 1.4 入库 ODSAdjFactor
+                    self.db.merge(obj)
+
+                # 4. Save ODS Adj Factor (Filtered)
                 if not df_adj.empty:
-                    for _, row in df_adj.iterrows():
+                    df_adj_filtered = df_adj[df_adj['ts_code'].isin(universe)]
+                    for _, row in df_adj_filtered.iterrows():
                         self.db.merge(ODSAdjFactor(
                             ts_code=row['ts_code'],
                             trade_date=row['trade_date'],
                             adj_factor=row['adj_factor']
                         ))
-                
+
                 self.db.commit()
-                print(f"  ✅ {trade_date}: 行情入库完成 (Stocks: {len(df_daily)})")
-                
+                print(f"  ✅ {trade_date}: Saved {len(daily_objs)} records (Filtered from {len(df_daily)})")
+
             except Exception as e:
                 self.db.rollback()
-                print(f"  ❌ {trade_date}: 处理失败 - {e}")
+                print(f"  ❌ {trade_date}: Failed - {e}")
 
-    def sync_financial_report(self, ts_code: str, start_date: str = None, end_date: str = None):
+    def sync_financial_daily(self, ann_date: str):
         """
-        S2/S4 场景: 财报数据更新 (ODS层 - JSONB)
-        [FIXED V2]: 强力修复 NaN -> None，兼容 PostgreSQL JSONB
+        S4 Scenario: Deep Core Update (Incremental)
+        Fetches financials by Announcement Date -> Filter -> Save.
         """
-        print(f"💰 开始同步财报: {ts_code}...")
+        print(f"💰 Syncing Financials for Ann Date: {ann_date}...")
+        universe = self._get_universe_pool()
         
         tasks = {
             "income": (ts_client.fetch_income, "income"),
@@ -156,25 +152,21 @@ class DataUpdater:
             "cashflow": (ts_client.fetch_cashflow, "cashflow"),
             "fina_indicator": (ts_client.fetch_fina_indicator, "indicator")
         }
-        
+
         for name, (api_func, category) in tasks.items():
             try:
-                # 1. 拉取数据
-                df = api_func(ts_code=ts_code, start_date=start_date, end_date=end_date)
-                if df.empty:
-                    continue
-                
-                # 2. [关键修复] 数据清洗
-                # 先转为 object 类型，防止 pandas 将 None 自动回滚为 NaN
-                # 然后将所有 NaN 替换为 None (JSON null)
+                # Fetch by Ann Date (Efficient)
+                df = api_func(ann_date=ann_date)
+                if df.empty: continue
+
+                # Funnel Filter
+                df = df[df['ts_code'].isin(universe)]
+                if df.empty: continue
+
+                # Handle NaNs for JSONB
                 df = df.astype(object).where(pd.notnull(df), None)
-                
-                # 3. 转换为字典列表
                 records = df.to_dict('records')
-                
-                # 4. 逐条入库 (Merge)
-                # 注意：这里使用 bulk_insert 会更快，但为了演示 update_flag 逻辑保持循环
-                # 生产环境建议优化为 bulk_insert_mappings
+
                 for record in records:
                     pk_data = {
                         "ts_code": record.get("ts_code"),
@@ -183,141 +175,122 @@ class DataUpdater:
                         "update_flag": record.get("update_flag", '0'),
                         "ann_date": record.get("ann_date"),
                         "category": category,
-                        "data": record # record 中的 NaN 现在是 None 了
+                        "data": record
                     }
-                    
                     self.db.merge(ODSFinanceReport(**pk_data))
                 
                 self.db.commit()
-                print(f"  - {name}: {len(records)} 条记录")
-                
+                print(f"  - {name}: Updated {len(records)} reports")
+
             except Exception as e:
-                self.db.rollback()
-                print(f"  ⚠️ {name} 同步失败: {e}")
+                print(f"  ⚠️ {name} Error: {e}")
 
     def process_market_dws(self, ts_code: str):
         """
-        DWS 核心逻辑: 计算复权价格与均线 (PRD 2.2)
-        触发时机: 单只股票 ODS 行情更新后
+        DWS: Calculate MA and QFQ Price (Per Stock)
         """
-        print(f"🧮 计算 DWS 指标: {ts_code}...")
-        
-        # 1. 读取 ODS 数据 (Raw Price + Adj Factor)
-        # 使用 pandas read_sql 简化处理
-        query_daily = f"SELECT * FROM ods_market_daily WHERE ts_code = '{ts_code}' ORDER BY trade_date"
+        # (Same logic as V1, simply retained)
+        # 1. Read ODS
+        query = f"SELECT * FROM ods_market_daily WHERE ts_code = '{ts_code}' ORDER BY trade_date"
         query_adj = f"SELECT trade_date, adj_factor FROM ods_adj_factor WHERE ts_code = '{ts_code}' ORDER BY trade_date"
         
-        df_daily = pd.read_sql(query_daily, self.db.bind)
+        df_daily = pd.read_sql(query, self.db.bind)
         df_adj = pd.read_sql(query_adj, self.db.bind)
         
-        if df_daily.empty or df_adj.empty:
-            print("  ⚠️ 数据不足，跳过计算")
-            return
+        if df_daily.empty or df_adj.empty: return
 
-        # 2. 合并复权因子
+        # 2. Merge & Calc
         df = pd.merge(df_daily, df_adj, on='trade_date', how='left')
-        # 填充缺失因子 (向前填充)
         df['adj_factor'] = df['adj_factor'].ffill()
-        
-        # 3. 计算前复权价格 (QFQ)
-        # 公式: P_qfq = P_raw * (Factor_curr / Factor_latest) 
         latest_factor = df['adj_factor'].iloc[-1]
         df['close_qfq'] = df['close'] * (df['adj_factor'] / latest_factor)
-        
-        # 4. 计算均线 (MA)
-        # PRD 2.2: MA20, MA50, MA120, MA250, MA850
-        ma_list = [20, 50, 120, 250, 850]
-        for ma in ma_list:
-            col_name = f'ma_{ma}'
-            # min_periods=ma 确保数据不够时为 NaN (None)
-            df[col_name] = df['close_qfq'].rolling(window=ma, min_periods=ma).mean()
-            
-        # 5. 准备入库数据 (DWSMarketIndicators)
-        dws_records = []
+
+        # 3. MA
+        for ma in [20, 50, 120, 250, 850]:
+            df[f'ma_{ma}'] = df['close_qfq'].rolling(window=ma, min_periods=ma).mean()
+
+        # 4. Save
         for _, row in df.iterrows():
-            # 基础指标转换
-            record = {
-                "ts_code": row['ts_code'],
-                "trade_date": row['trade_date'],
-                "close_qfq": row['close_qfq'],
-                "ma_20": row['ma_20'] if pd.notna(row['ma_20']) else None,
-                "ma_50": row['ma_50'] if pd.notna(row['ma_50']) else None,
-                "ma_120": row['ma_120'] if pd.notna(row['ma_120']) else None,
-                "ma_250": row['ma_250'] if pd.notna(row['ma_250']) else None,
-                "ma_850": row['ma_850'] if pd.notna(row['ma_850']) else None,
-                # 透传 ODS 基础字段 (用于雷达筛选)
-                "turnover_rate": None, # 需从 daily_basic 补充，此处暂留空或后续 Join
-                "pe_ttm": None,        # 同上
-                "pb": None,            # 同上
-                "total_mv": None       # 同上
-            }
-            dws_records.append(record)
-            
-        # 6. 批量入库 (Upsert)
-        for r in dws_records:
-            self.db.merge(DWSMarketIndicators(**r))
-            
+            self.db.merge(DWSMarketIndicators(
+                ts_code=row['ts_code'],
+                trade_date=row['trade_date'],
+                close_qfq=row['close_qfq'],
+                ma_20=row['ma_20'] if pd.notna(row['ma_20']) else None,
+                ma_50=row['ma_50'] if pd.notna(row['ma_50']) else None,
+                ma_120=row['ma_120'] if pd.notna(row['ma_120']) else None,
+                ma_250=row['ma_250'] if pd.notna(row['ma_250']) else None,
+                ma_850=row['ma_850'] if pd.notna(row['ma_850']) else None,
+            ))
         self.db.commit()
-        print(f"  ✅ DWS 计算完成: {len(dws_records)} 条均线数据")
 
     def process_finance_dws(self, ts_code: str):
         """
-        DWS 核心逻辑: 标准化财务宽表清洗 (PRD 2.2)
-        规则: 仅提取 report_type='1' (合并报表)
+        DWS: Standardize Finance (Extract Report Type 1)
         """
-        print(f"🧹 清洗财务数据: {ts_code}...")
-        
-        # 1. 提取所有类型的 JSONB 数据
-        # 获取该股票所有 report_type='1' 的记录
+        # (Same logic as V1, retained for completeness)
         reports = self.db.query(ODSFinanceReport).filter(
             ODSFinanceReport.ts_code == ts_code,
             ODSFinanceReport.report_type == '1'
         ).all()
         
-        # 按 end_date 聚合数据
-        # 结构: { '20231231': { 'revenue': 100, 'roe': 5... } }
-        merged_data = {}
-        
+        merged = {}
         for r in reports:
-            if r.end_date not in merged_data:
-                merged_data[r.end_date] = {"ann_date": r.ann_date}
-            
-            # 将 JSONB 中的数据打平合并
-            # 映射关系参考 core/mapping.py
-            # 实际生产建议严格按 Mapping 提取，这里做自动映射
-            raw_dict = r.data
-            target_fields = [
-                'revenue', 'n_income_attr_p', 'n_cashflow_act', 
-                'debt_to_assets', 'roe', 'grossprofit_margin'
-            ]
-            
-            for field in target_fields:
-                if field in raw_dict:
-                    merged_data[r.end_date][field] = raw_dict[field]
-
-        # 2. 入库 DWSFinanceStd
-        for end_date, metrics in merged_data.items():
-            dws_obj = DWSFinanceStd(
-                ts_code=ts_code,
-                end_date=end_date,
-                ann_date=metrics.get('ann_date'),
-                revenue=metrics.get('revenue'),
-                n_income_attr_p=metrics.get('n_income_attr_p'),
-                n_cashflow_act=metrics.get('n_cashflow_act'),
-                debt_to_assets=metrics.get('debt_to_assets'),
-                roe=metrics.get('roe'),
-                grossprofit_margin=metrics.get('grossprofit_margin')
-            )
-            self.db.merge(dws_obj)
-            
+            if r.end_date not in merged: merged[r.end_date] = {"ann_date": r.ann_date}
+            # Simplified mapping
+            data = r.data
+            for k in ['revenue', 'n_income_attr_p', 'n_cashflow_act', 'debt_to_assets', 'roe', 'grossprofit_margin']:
+                if k in data: merged[r.end_date][k] = data[k]
+        
+        for end_date, m in merged.items():
+            self.db.merge(DWSFinanceStd(
+                ts_code=ts_code, end_date=end_date, ann_date=m.get('ann_date'),
+                revenue=m.get('revenue'), n_income_attr_p=m.get('n_income_attr_p'),
+                n_cashflow_act=m.get('n_cashflow_act'), debt_to_assets=m.get('debt_to_assets'),
+                roe=m.get('roe'), grossprofit_margin=m.get('grossprofit_margin')
+            ))
         self.db.commit()
-        print(f"  ✅ 财务清洗完成: {len(merged_data)} 个报告期")
 
-    def close(self):
-        self.db.close()
+    def run_daily_routine(self):
+        """
+        [The Orchestrator] 
+        Generator function for NiceGUI. 
+        Executes the S3/S4 flows for 'Today'.
+        """
+        today = datetime.now().strftime('%Y%m%d')
+        # today = "20231229" # Debug hardcode if needed
+        
+        yield f"🚀 Starting Daily Routine for {today}..."
+        
+        # 1. Universe Update
+        yield "Step 1/4: Updating Stock Universe..."
+        self.sync_stock_list()
+        
+        # 2. Market Data (Wide Funnel)
+        yield "Step 2/4: Syncing Market Data..."
+        self.sync_daily_market(today, today)
+        
+        # 3. Financial Data (Incremental)
+        yield "Step 3/4: Checking Financial Announcements..."
+        self.sync_financial_daily(today)
+        
+        # 4. DWS Calculation (Deep Loop)
+        yield "Step 4/4: Recalculating DWS Indicators..."
+        universe = self._get_universe_pool()
+        total = len(universe)
+        for i, ts_code in enumerate(universe):
+            if i % 10 == 0:
+                yield f"  > Processing DWS: {i}/{total} ({ts_code})..."
+            self.process_market_dws(ts_code)
+            self.process_finance_dws(ts_code)
+            
+        yield "✅ Daily Routine Completed Successfully!"
 
-# 快捷入口
 if __name__ == "__main__":
-    updater = DataUpdater()
-    updater.sync_stock_list()
-    updater.close()
+    # CLI Test
+    u = DataUpdater()
+    # Pull last 3 days for test
+    start = (datetime.now() - timedelta(days=3)).strftime('%Y%m%d')
+    end = datetime.now().strftime('%Y%m%d')
+    u.sync_stock_list()
+    u.sync_daily_market(start, end)
+    u.close()
