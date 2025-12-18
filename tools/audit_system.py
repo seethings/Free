@@ -38,27 +38,46 @@ class DataAuditor:
 
     def audit_financial_completeness(self):
         """审计财务报表齐备性 (四大金刚)"""
-        print("\n[2. 财务报表齐备性审计]")
+        print("\n[2. 财务报表齐备性审计 (PRD 1.3 2015+ 标准)]")
         
-        # 统计每个 ts_code 在每个 end_date 下拥有的 category 数量
-        # 理论上，一个健康的报告期应该拥有 4 个 category (income, balance, cashflow, indicator)
+        # 修改点：增加日期过滤，确保不审计 2015 之前的无效数据
         query = text("""
-            SELECT ts_code, end_date, COUNT(DISTINCT category) as cat_count
-            FROM ods_finance_report
-            WHERE report_type = '1'
-            GROUP BY ts_code, end_date
-            HAVING COUNT(DISTINCT category) < 4
+            WITH report_stats AS (
+                SELECT ts_code, end_date, COUNT(DISTINCT category) as cat_count
+                FROM ods_finance_report
+                WHERE report_type = '1' AND end_date >= '20150101'
+                GROUP BY ts_code, end_date
+            )
+            SELECT 
+                COUNT(*) as total_reports,
+                SUM(CASE WHEN cat_count = 4 THEN 1 ELSE 0 END) as perfect_reports
+            FROM report_stats
         """)
         
-        results = self.db.execute(query).fetchall()
+        res = self.db.execute(query).fetchone()
+        total = res.total_reports
+        perfect = res.perfect_reports or 0
+        health_rate = (perfect / total * 100) if total > 0 else 0
         
-        if not results:
-            print("  ✅ 财务报表审计通过：所有入库报告期均已凑齐四大接口数据。")
-        else:
-            print(f"  ❌ 异常: 发现 {len(results)} 组财报数据不完整 (缺少部分接口数据)。")
-            # 打印前 5 个异常样本
-            for r in results[:5]:
-                print(f"    - {r.ts_code} [{r.end_date}]: 仅有 {r.cat_count}/4 张报表")
+        print(f"  - 审计报告期总数: {total}")
+        print(f"  - 完整报告期 (4/4): {perfect}")
+        print(f"  - 2015后财务底座健康度: {health_rate:.2f}%")
+        
+        if health_rate < 100:
+            # 展示真正的 2015 后的异常
+            error_query = text("""
+                SELECT ts_code, end_date, COUNT(DISTINCT category) as cat_count
+                FROM ods_finance_report
+                WHERE report_type = '1' AND end_date >= '20150101'
+                GROUP BY ts_code, end_date
+                HAVING COUNT(DISTINCT category) < 4
+                LIMIT 5
+            """)
+            errors = self.db.execute(error_query).fetchall()
+            if errors:
+                print(f"  ❌ 发现 {total - perfect} 组异常，样本如下:")
+                for r in errors:
+                    print(f"    - {r.ts_code} [{r.end_date}]: 仅有 {r.cat_count}/4")
 
     def run_full_audit(self):
         try:

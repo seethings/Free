@@ -1,5 +1,5 @@
 # INVEST SYSTEM CONTEXT DUMP
-# Timestamp: 2025-12-19 01:21:51.882076
+# Timestamp: 2025-12-19 03:21:38.978410
 # Security: Sensitive files (.env) and temp dirs are EXCLUDED.
 
 📦 PROJECT STRUCTURE (Ignored: .env, temp/, note/, data/)
@@ -21,6 +21,7 @@
         📄 doc_generator.py  # 上下文生成工具 [工具]
         📄 git_auto.py  # Git自动助理 [工具]
         📄 manage_watchlist.py
+        📄 probe_2024.py
         📄 reset_db.py
     📂 core/
         📄 config.py  # 全局配置加载器 [核心]
@@ -451,27 +452,46 @@ class DataAuditor:
 
     def audit_financial_completeness(self):
         """审计财务报表齐备性 (四大金刚)"""
-        print("\n[2. 财务报表齐备性审计]")
+        print("\n[2. 财务报表齐备性审计 (PRD 1.3 2015+ 标准)]")
         
-        # 统计每个 ts_code 在每个 end_date 下拥有的 category 数量
-        # 理论上，一个健康的报告期应该拥有 4 个 category (income, balance, cashflow, indicator)
+        # 修改点：增加日期过滤，确保不审计 2015 之前的无效数据
         query = text("""
-            SELECT ts_code, end_date, COUNT(DISTINCT category) as cat_count
-            FROM ods_finance_report
-            WHERE report_type = '1'
-            GROUP BY ts_code, end_date
-            HAVING COUNT(DISTINCT category) < 4
+            WITH report_stats AS (
+                SELECT ts_code, end_date, COUNT(DISTINCT category) as cat_count
+                FROM ods_finance_report
+                WHERE report_type = '1' AND end_date >= '20150101'
+                GROUP BY ts_code, end_date
+            )
+            SELECT 
+                COUNT(*) as total_reports,
+                SUM(CASE WHEN cat_count = 4 THEN 1 ELSE 0 END) as perfect_reports
+            FROM report_stats
         """)
         
-        results = self.db.execute(query).fetchall()
+        res = self.db.execute(query).fetchone()
+        total = res.total_reports
+        perfect = res.perfect_reports or 0
+        health_rate = (perfect / total * 100) if total > 0 else 0
         
-        if not results:
-            print("  ✅ 财务报表审计通过：所有入库报告期均已凑齐四大接口数据。")
-        else:
-            print(f"  ❌ 异常: 发现 {len(results)} 组财报数据不完整 (缺少部分接口数据)。")
-            # 打印前 5 个异常样本
-            for r in results[:5]:
-                print(f"    - {r.ts_code} [{r.end_date}]: 仅有 {r.cat_count}/4 张报表")
+        print(f"  - 审计报告期总数: {total}")
+        print(f"  - 完整报告期 (4/4): {perfect}")
+        print(f"  - 2015后财务底座健康度: {health_rate:.2f}%")
+        
+        if health_rate < 100:
+            # 展示真正的 2015 后的异常
+            error_query = text("""
+                SELECT ts_code, end_date, COUNT(DISTINCT category) as cat_count
+                FROM ods_finance_report
+                WHERE report_type = '1' AND end_date >= '20150101'
+                GROUP BY ts_code, end_date
+                HAVING COUNT(DISTINCT category) < 4
+                LIMIT 5
+            """)
+            errors = self.db.execute(error_query).fetchall()
+            if errors:
+                print(f"  ❌ 发现 {total - perfect} 组异常，样本如下:")
+                for r in errors:
+                    print(f"    - {r.ts_code} [{r.end_date}]: 仅有 {r.cat_count}/4")
 
     def run_full_audit(self):
         try:
@@ -1029,6 +1049,45 @@ if __name__ == "__main__":
         parser.print_help()
     
     wm.close()
+
+------------------------------------------------------------
+FILE PATH: tools/probe_2024.py
+------------------------------------------------------------
+import sys
+import os
+from sqlalchemy import text
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from database.models import SessionLocal
+
+def probe_latest_year():
+    db = SessionLocal()
+    target_period = '20250930'
+    print(f"🕵️‍♂️ 正在专项审计 {target_period} (最新年报期) 的数据完整性...")
+    
+    query = text("""
+        SELECT ts_code, COUNT(DISTINCT category) as cat_count
+        FROM ods_finance_report
+        WHERE end_date = :period AND report_type = '1'
+        GROUP BY ts_code
+    """)
+    
+    results = db.execute(query, {"period": target_period}).fetchall()
+    total = len(results)
+    perfect = len([r for r in results if r.cat_count == 4])
+    
+    print(f"\n📈 审计结果:")
+    print(f"  - 目标标的总数: {total}")
+    print(f"  - 满分标的 (4/4): {perfect}")
+    print(f"  - 数据达成率: {(perfect/total*100 if total > 0 else 0):.2f}%")
+    
+    if perfect < total:
+        print("\n❌ 缺失样本探测 (前5条):")
+        for r in [r for r in results if r.cat_count < 4][:5]:
+            print(f"    - {r.ts_code}: 仅有 {r.cat_count}/4 张报表")
+    db.close()
+
+if __name__ == "__main__":
+    probe_latest_year()
 
 ------------------------------------------------------------
 FILE PATH: tools/reset_db.py
