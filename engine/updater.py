@@ -1,4 +1,6 @@
 import pandas as pd
+import time
+from datetime import datetime, timedelta
 from sqlalchemy import text
 from interface.tushare_client import ts_client
 from database.models import (
@@ -6,8 +8,7 @@ from database.models import (
     ODSMarketDaily, ODSAdjFactor, ODSFinanceReport, 
     DWSMarketIndicators, DWSFinanceStd
 )
-from datetime import datetime, timedelta
-import time
+from core.mapping import SOURCE_TABLE_MAP
 
 class DataUpdater:
     def __init__(self):
@@ -17,26 +18,14 @@ class DataUpdater:
         self.db.close()
 
     def _get_universe_pool(self) -> set:
-        """
-        [Core Filter] Get the set of TS_CODES for CSI800 + Watchlist.
-        PRD 1.2: Only maintain these stocks.
-        """
-        # 1. Get CSI800
+        """[PRD 1.2] 获取中证800+自选股的并集"""
         csi800 = self.db.query(StockBasic.ts_code).filter(StockBasic.is_csi800 == True).all()
-        pool = {row.ts_code for row in csi800}
-        
-        # 2. Get Watchlist
         watchlist = self.db.query(Watchlist.ts_code).all()
-        for row in watchlist:
-            pool.add(row.ts_code)
-            
-        print(f"🎯 Universe Pool Size: {len(pool)}")
+        pool = {row.ts_code for row in csi800} | {row.ts_code for row in watchlist}
         return pool
 
     def sync_stock_list(self):
-        """
-        PRD 3.1: Update Stock List & CSI800 Marks
-        """
+        """[PRD 3.1] 全量同步股票列表并标记中证800"""
         print("🔄 Syncing Stock List...")
         df_basics = ts_client.fetch_stock_basic()
         if df_basics.empty: return
@@ -44,7 +33,6 @@ class DataUpdater:
         # Mark CSI 800
         try:
             now_str = datetime.now().strftime("%Y%m%d")
-            # Pull index weights (requires 2000 points, verified)
             df_csi800 = ts_client.pro.index_weight(index_code='000906.SH', start_date='20240101', end_date=now_str)
             
             if not df_csi800.empty:
@@ -53,7 +41,6 @@ class DataUpdater:
                 csi800_set = set(df_latest['con_code'].tolist())
             else:
                 csi800_set = set()
-                print("⚠️ Warning: Could not fetch CSI800 constituents.")
         except Exception as e:
             print(f"⚠️ CSI800 Fetch Error: {e}")
             csi800_set = set()
@@ -80,70 +67,101 @@ class DataUpdater:
         self.db.commit()
         print(f"✅ Stock List Synced. CSI800 Count: {len(csi800_set)}")
 
-    def sync_daily_market(self, start_date: str, end_date: str):
-        """
-        S3 Scenario: Wide Core Update (Funnel Mode)
-        Fetches ALL market data, filters for Universe, saves to ODS.
-        """
-        print(f"📈 Syncing Market ({start_date} - {end_date})...")
-        universe = self._get_universe_pool()
-        if not universe:
-            print("⚠️ Universe is empty! Run sync_stock_list first or add to Watchlist.")
-            return
+    # --- 场景 S1/S2/S5: 垂直历史回溯 (按代码同步) ---
 
-        dates = pd.date_range(start=start_date, end=end_date).strftime('%Y%m%d').tolist()
+    def sync_stock_history(self, ts_code: str, start_date="20150101"):
+        """补全单只股票的所有历史数据 (行情+财报)"""
+        # 1. 行情与复权因子 [cite: 15-16]
+        df_daily = ts_client.fetch_daily(ts_code=ts_code, start_date=start_date)
+        df_adj = ts_client.fetch_adj_factor(ts_code=ts_code, start_date=start_date)
         
-        for trade_date in dates:
-            try:
-                # 1. Fetch Full Market (1 API Call)
-                df_daily = ts_client.fetch_daily(trade_date=trade_date)
-                df_adj = ts_client.fetch_adj_factor(trade_date=trade_date)
-                
-                if df_daily.empty:
-                    print(f"  - {trade_date}: No Trading Data (Holiday?)")
-                    continue
+        if not df_daily.empty:
+            for _, row in df_daily.iterrows():
+                self.db.merge(ODSMarketDaily(
+                    ts_code=row['ts_code'], trade_date=row['trade_date'],
+                    open=row['open'], high=row['high'], low=row['low'], close=row['close'],
+                    pre_close=row['pre_close'], change=row['change'], pct_chg=row['pct_chg'],
+                    vol=row['vol'], amount=row['amount']
+                ))
 
-                # 2. THE FUNNEL: Filter by Universe
-                df_daily_filtered = df_daily[df_daily['ts_code'].isin(universe)]
-                
-                # 3. Save ODS Market
-                daily_objs = []
-                for _, row in df_daily_filtered.iterrows():
-                    daily_objs.append(ODSMarketDaily(
-                        ts_code=row['ts_code'],
-                        trade_date=row['trade_date'],
-                        open=row['open'], high=row['high'], low=row['low'], close=row['close'],
-                        pre_close=row['pre_close'], change=row['change'], pct_chg=row['pct_chg'],
-                        vol=row['vol'], amount=row['amount']
+        if not df_adj.empty:
+            for _, row in df_adj.iterrows():
+                self.db.merge(ODSAdjFactor(ts_code=row['ts_code'], trade_date=row['trade_date'], adj_factor=row['adj_factor']))
+
+        # 2. 四大财报同步 (JSONB 存储) [cite: 90-95]
+        tasks = {
+            "income": ts_client.fetch_income,
+            "balancesheet": ts_client.fetch_balancesheet,
+            "cashflow": ts_client.fetch_cashflow,
+            "fina_indicator": ts_client.fetch_fina_indicator
+        }
+        for category, api_func in tasks.items():
+            df = api_func(ts_code=ts_code, start_date=start_date)
+            if not df.empty:
+                # --- 核心修复：内存预去重 ---
+                # 定义我们的五维主键 (category 在循环中固定)
+                pk_cols = ['ts_code', 'end_date', 'report_type', 'update_flag']
+                # Tushare 接口返回的字段名可能略有不同，先做个安全检查
+                actual_pk = [c for c in pk_cols if c in df.columns]
+                # 根据主键去重，保留最后一条（通常是最新的）
+                df = df.drop_duplicates(subset=actual_pk, keep='last')
+
+                df = df.astype(object).where(pd.notnull(df), None)
+                for record in df.to_dict('records'):
+                    self.db.merge(ODSFinanceReport(
+                        ts_code=record['ts_code'], end_date=record['end_date'],
+                        report_type=record.get('report_type', '1'),
+                        update_flag=record.get('update_flag', '0'),
+                        category=category, data=record, ann_date=record.get('ann_date')
                     ))
-                
-                # Bulk save is safer for memory, but merge is fine for <1000 rows
-                for obj in daily_objs:
-                    self.db.merge(obj)
-
-                # 4. Save ODS Adj Factor (Filtered)
-                if not df_adj.empty:
-                    df_adj_filtered = df_adj[df_adj['ts_code'].isin(universe)]
-                    for _, row in df_adj_filtered.iterrows():
-                        self.db.merge(ODSAdjFactor(
-                            ts_code=row['ts_code'],
-                            trade_date=row['trade_date'],
-                            adj_factor=row['adj_factor']
-                        ))
-
+                # 每一类报表提交一次，缩小冲突范围并提升调试效率
                 self.db.commit()
-                print(f"  ✅ {trade_date}: Saved {len(daily_objs)} records (Filtered from {len(df_daily)})")
 
-            except Exception as e:
-                self.db.rollback()
-                print(f"  ❌ {trade_date}: Failed - {e}")
+    # --- 场景 S3: 水平每日行情 (按日期同步) ---
+
+    def sync_daily_market(self, trade_date: str):
+        """[PRD S3] 每日增量行情同步 (水平模式)"""
+        universe = self._get_universe_pool()
+        if not universe: return
+
+        try:
+            # 1. Fetch Full Market
+            df_daily = ts_client.fetch_daily(trade_date=trade_date)
+            df_adj = ts_client.fetch_adj_factor(trade_date=trade_date)
+            
+            if df_daily.empty: return
+
+            # 2. Funnel Filter
+            df_daily_filtered = df_daily[df_daily['ts_code'].isin(universe)]
+            
+            # 3. Save ODS
+            for _, row in df_daily_filtered.iterrows():
+                self.db.merge(ODSMarketDaily(
+                    ts_code=row['ts_code'], trade_date=row['trade_date'],
+                    open=row['open'], high=row['high'], low=row['low'], close=row['close'],
+                    pre_close=row['pre_close'], change=row['change'], pct_chg=row['pct_chg'],
+                    vol=row['vol'], amount=row['amount']
+                ))
+
+            if not df_adj.empty:
+                df_adj_filtered = df_adj[df_adj['ts_code'].isin(universe)]
+                for _, row in df_adj_filtered.iterrows():
+                    self.db.merge(ODSAdjFactor(
+                        ts_code=row['ts_code'], trade_date=row['trade_date'],
+                        adj_factor=row['adj_factor']
+                    ))
+
+            self.db.commit()
+            print(f"  ✅ Market Snapshot {trade_date}: Saved {len(df_daily_filtered)} records.")
+
+        except Exception as e:
+            self.db.rollback()
+            print(f"  ❌ Market Snapshot Failed: {e}")
+
+    # --- 场景 S4: 水平每日财报 (按公告日同步) ---
 
     def sync_financial_daily(self, ann_date: str):
-        """
-        S4 Scenario: Deep Core Update (Incremental)
-        Fetches financials by Announcement Date -> Filter -> Save.
-        """
-        print(f"💰 Syncing Financials for Ann Date: {ann_date}...")
+        """[PRD S4] 每日增量财报同步 (水平模式)"""
         universe = self._get_universe_pool()
         
         tasks = {
@@ -155,42 +173,30 @@ class DataUpdater:
 
         for name, (api_func, category) in tasks.items():
             try:
-                # Fetch by Ann Date (Efficient)
                 df = api_func(ann_date=ann_date)
                 if df.empty: continue
 
-                # Funnel Filter
                 df = df[df['ts_code'].isin(universe)]
                 if df.empty: continue
 
-                # Handle NaNs for JSONB
                 df = df.astype(object).where(pd.notnull(df), None)
                 records = df.to_dict('records')
 
                 for record in records:
-                    pk_data = {
-                        "ts_code": record.get("ts_code"),
-                        "end_date": record.get("end_date"),
-                        "report_type": record.get("report_type", '1'), 
-                        "update_flag": record.get("update_flag", '0'),
-                        "ann_date": record.get("ann_date"),
-                        "category": category,
-                        "data": record
-                    }
-                    self.db.merge(ODSFinanceReport(**pk_data))
-                
+                    self.db.merge(ODSFinanceReport(
+                        ts_code=record['ts_code'], end_date=record['end_date'],
+                        report_type=record.get('report_type', '1'),
+                        update_flag=record.get('update_flag', '0'),
+                        category=category, data=record, ann_date=record.get('ann_date')
+                    ))
                 self.db.commit()
-                print(f"  - {name}: Updated {len(records)} reports")
-
             except Exception as e:
                 print(f"  ⚠️ {name} Error: {e}")
 
+    # --- DWS 计算逻辑 ---
+
     def process_market_dws(self, ts_code: str):
-        """
-        DWS: Calculate MA and QFQ Price (Per Stock)
-        """
-        # (Same logic as V1, simply retained)
-        # 1. Read ODS
+        """DWS: Calculate MA and QFQ Price"""
         query = f"SELECT * FROM ods_market_daily WHERE ts_code = '{ts_code}' ORDER BY trade_date"
         query_adj = f"SELECT trade_date, adj_factor FROM ods_adj_factor WHERE ts_code = '{ts_code}' ORDER BY trade_date"
         
@@ -199,17 +205,14 @@ class DataUpdater:
         
         if df_daily.empty or df_adj.empty: return
 
-        # 2. Merge & Calc
         df = pd.merge(df_daily, df_adj, on='trade_date', how='left')
         df['adj_factor'] = df['adj_factor'].ffill()
         latest_factor = df['adj_factor'].iloc[-1]
         df['close_qfq'] = df['close'] * (df['adj_factor'] / latest_factor)
 
-        # 3. MA
         for ma in [20, 50, 120, 250, 850]:
             df[f'ma_{ma}'] = df['close_qfq'].rolling(window=ma, min_periods=ma).mean()
 
-        # 4. Save
         for _, row in df.iterrows():
             self.db.merge(DWSMarketIndicators(
                 ts_code=row['ts_code'],
@@ -224,10 +227,7 @@ class DataUpdater:
         self.db.commit()
 
     def process_finance_dws(self, ts_code: str):
-        """
-        DWS: Standardize Finance (Extract Report Type 1)
-        """
-        # (Same logic as V1, retained for completeness)
+        """DWS: Standardize Finance"""
         reports = self.db.query(ODSFinanceReport).filter(
             ODSFinanceReport.ts_code == ts_code,
             ODSFinanceReport.report_type == '1'
@@ -236,8 +236,8 @@ class DataUpdater:
         merged = {}
         for r in reports:
             if r.end_date not in merged: merged[r.end_date] = {"ann_date": r.ann_date}
-            # Simplified mapping
             data = r.data
+            # TODO: Use FINANCE_EXTRACT_PIPELINE from mapping.py for industry-specific extraction
             for k in ['revenue', 'n_income_attr_p', 'n_cashflow_act', 'debt_to_assets', 'roe', 'grossprofit_margin']:
                 if k in data: merged[r.end_date][k] = data[k]
         
@@ -250,47 +250,55 @@ class DataUpdater:
             ))
         self.db.commit()
 
-    def run_daily_routine(self):
-        """
-        [The Orchestrator] 
-        Generator function for NiceGUI. 
-        Executes the S3/S4 flows for 'Today'.
-        """
-        today = datetime.now().strftime('%Y%m%d')
-        # today = "20231229" # Debug hardcode if needed
+    # --- 调度器 (支持进度返回) ---
+
+    def run_full_backfill(self, start_date="20150101"):
+        """[PRD S5] 核心池财务与行情全量初始化"""
+        yield "🚀 开始全量回溯 (Full Backfill)..."
+        self.sync_stock_list()
         
+        universe = list(self._get_universe_pool())
+        total = len(universe)
+        
+        for i, ts_code in enumerate(universe):
+            # 使用 yield 让前端 NiceGUI 可以实时更新进度条 [cite: 107-108]
+            yield f"正在补全第 {i+1}/{total} 只: {ts_code}"
+            try:
+                self.sync_stock_history(ts_code, start_date)
+                # DWS Calculation
+                self.process_market_dws(ts_code)
+                self.process_finance_dws(ts_code)
+                time.sleep(0.1) # 频次保护
+            except Exception as e:
+                yield f"⚠️ {ts_code} 同步失败: {str(e)}"
+        yield "✅ 全量回溯任务完成"
+
+    def run_daily_routine(self):
+        """[PRD S3/S4] 日常更新流程"""
+        today = datetime.now().strftime('%Y%m%d')
         yield f"🚀 Starting Daily Routine for {today}..."
         
-        # 1. Universe Update
         yield "Step 1/4: Updating Stock Universe..."
         self.sync_stock_list()
         
-        # 2. Market Data (Wide Funnel)
         yield "Step 2/4: Syncing Market Data..."
-        self.sync_daily_market(today, today)
+        self.sync_daily_market(today)
         
-        # 3. Financial Data (Incremental)
         yield "Step 3/4: Checking Financial Announcements..."
         self.sync_financial_daily(today)
         
-        # 4. DWS Calculation (Deep Loop)
         yield "Step 4/4: Recalculating DWS Indicators..."
-        universe = self._get_universe_pool()
+        universe = list(self._get_universe_pool())
         total = len(universe)
         for i, ts_code in enumerate(universe):
-            if i % 10 == 0:
-                yield f"  > Processing DWS: {i}/{total} ({ts_code})..."
+            if i % 50 == 0:
+                yield f"  > DWS 计算进度: {i}/{total}..."
             self.process_market_dws(ts_code)
             self.process_finance_dws(ts_code)
             
         yield "✅ Daily Routine Completed Successfully!"
 
 if __name__ == "__main__":
-    # CLI Test
     u = DataUpdater()
-    # Pull last 3 days for test
-    start = (datetime.now() - timedelta(days=3)).strftime('%Y%m%d')
-    end = datetime.now().strftime('%Y%m%d')
-    u.sync_stock_list()
-    u.sync_daily_market(start, end)
+    # u.sync_stock_list()
     u.close()

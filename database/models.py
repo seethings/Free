@@ -82,17 +82,17 @@ class ODSFinanceReport(Base):
     """
     __tablename__ = "ods_finance_report"
 
-    # 复合主键
+    # 复合主键：必须包含 category 以区分 income/balancesheet/cashflow 接口数据 [cite: 8, 93-95]
     ts_code = Column(String(20), primary_key=True)
     end_date = Column(String(8), primary_key=True, comment="报告期")
     report_type = Column(String(10), primary_key=True, comment="报表类型")
     update_flag = Column(String(5), primary_key=True, default='0', comment="更新标记")
+    category = Column(String(20), primary_key=True, index=True, comment="报表类别") # 升级为主键
     
     ann_date = Column(String(8), comment="公告日期")
     
     # 核心字段
     data = Column(JSONB, comment="原始财务数据JSON")
-    category = Column(String(20), index=True, comment="报表类别")
 
 # --- DWS Layer (标准服务层 - Strict Logic) ---
 
