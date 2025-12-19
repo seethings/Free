@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Float, Boolean, DateTime, Integer, Text, PrimaryKeyConstraint
+from sqlalchemy import Column, String, Float, Boolean, DateTime, Integer, Text, PrimaryKeyConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from sqlalchemy import create_engine
@@ -74,6 +74,18 @@ class ODSAdjFactor(Base):
     ts_code = Column(String(20), primary_key=True)
     trade_date = Column(String(8), primary_key=True)
     adj_factor = Column(Float)
+
+class ODSDailyBasic(Base):
+    """ODS: 每日指标原始表 (PE/PB/换手率/总市值)"""
+    __tablename__ = 'ods_daily_basic'
+
+    ts_code = Column(String(20), primary_key=True)
+    trade_date = Column(String(8), primary_key=True)
+    pe_ttm = Column(Float)
+    pb = Column(Float)
+    turnover_rate = Column(Float)
+    total_mv = Column(Float) # 总市值
+    update_flag = Column(DateTime, default=func.now())
 
 class ODSFinanceReport(Base):
     """

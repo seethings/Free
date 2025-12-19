@@ -6,7 +6,7 @@ from interface.tushare_client import ts_client
 from database.models import (
     SessionLocal, StockBasic, Watchlist, 
     ODSMarketDaily, ODSAdjFactor, ODSFinanceReport, 
-    DWSMarketIndicators, DWSFinanceStd
+    DWSMarketIndicators, DWSFinanceStd, ODSDailyBasic
 )
 from core.mapping import SOURCE_TABLE_MAP
 
@@ -88,6 +88,9 @@ class DataUpdater:
             for _, row in df_adj.iterrows():
                 self.db.merge(ODSAdjFactor(ts_code=row['ts_code'], trade_date=row['trade_date'], adj_factor=row['adj_factor']))
 
+        # 1.1 每日指标 (PE/PB/市值)
+        self.sync_daily_basic(ts_code, start_date)
+
         # 2. 四大财报同步 (JSONB 存储) [cite: 90-95]
         tasks = {
             "income": ts_client.fetch_income,
@@ -116,6 +119,22 @@ class DataUpdater:
                     ))
                 # 每一类报表提交一次，缩小冲突范围并提升调试效率
                 self.db.commit()
+
+    def sync_daily_basic(self, ts_code: str, start_date: str):
+        """同步 ODS 层每日指标"""
+        df = ts_client.pro.daily_basic(ts_code=ts_code, start_date=start_date)
+        if df.empty: return
+        
+        for _, row in df.iterrows():
+            self.db.merge(ODSDailyBasic(
+                ts_code=row['ts_code'],
+                trade_date=row['trade_date'],
+                pe_ttm=row.get('pe_ttm'),
+                pb=row.get('pb'),
+                turnover_rate=row.get('turnover_rate'),
+                total_mv=row.get('total_mv')
+            ))
+        self.db.commit()
 
     # --- 场景 S3: 水平每日行情 (按日期同步) ---
 
@@ -196,27 +215,38 @@ class DataUpdater:
     # --- DWS 计算逻辑 ---
 
     def process_market_dws(self, ts_code: str):
-        """DWS: Calculate MA and QFQ Price"""
-        query = f"SELECT * FROM ods_market_daily WHERE ts_code = '{ts_code}' ORDER BY trade_date"
-        query_adj = f"SELECT trade_date, adj_factor FROM ods_adj_factor WHERE ts_code = '{ts_code}' ORDER BY trade_date"
+        """DWS: 计算均线、QFQ 并补全基本面指标"""
+        # 1. 联合查询 ODS 行情和每日指标 (daily_basic)
+        query = text("""
+            SELECT m.*, b.pe_ttm, b.pb, b.total_mv, b.turnover_rate, a.adj_factor
+            FROM ods_market_daily m
+            LEFT JOIN ods_daily_basic b ON m.ts_code = b.ts_code AND m.trade_date = b.trade_date
+            LEFT JOIN ods_adj_factor a ON m.ts_code = a.ts_code AND m.trade_date = a.trade_date
+            WHERE m.ts_code = :ts_code
+            ORDER BY m.trade_date
+        """)
         
-        df_daily = pd.read_sql(query, self.db.bind)
-        df_adj = pd.read_sql(query_adj, self.db.bind)
-        
-        if df_daily.empty or df_adj.empty: return
+        df = pd.read_sql(query, self.db.bind, params={"ts_code": ts_code})
+        if df.empty: return
 
-        df = pd.merge(df_daily, df_adj, on='trade_date', how='left')
+        # 2. 计算前复权
         df['adj_factor'] = df['adj_factor'].ffill()
-        latest_factor = df['adj_factor'].iloc[-1]
+        latest_factor = df['adj_factor'].iloc[-1] if not df['adj_factor'].isnull().all() else 1.0
         df['close_qfq'] = df['close'] * (df['adj_factor'] / latest_factor)
 
+        # 3. 计算均线 [cite: 843]
         for ma in [20, 50, 120, 250, 850]:
             df[f'ma_{ma}'] = df['close_qfq'].rolling(window=ma, min_periods=ma).mean()
 
+        # 4. Upsert 写入 DWS
         for _, row in df.iterrows():
             self.db.merge(DWSMarketIndicators(
                 ts_code=row['ts_code'],
                 trade_date=row['trade_date'],
+                pe_ttm=row.get('pe_ttm'),
+                pb=row.get('pb'),
+                total_mv=row.get('total_mv'),
+                turnover_rate=row.get('turnover_rate'),
                 close_qfq=row['close_qfq'],
                 ma_20=row['ma_20'] if pd.notna(row['ma_20']) else None,
                 ma_50=row['ma_50'] if pd.notna(row['ma_50']) else None,
@@ -227,7 +257,7 @@ class DataUpdater:
         self.db.commit()
 
     def process_finance_dws(self, ts_code: str):
-        """DWS: Standardize Finance"""
+        """DWS: 标准化财务炼制 (行业感知版) [cite: 845-848]"""
         reports = self.db.query(ODSFinanceReport).filter(
             ODSFinanceReport.ts_code == ts_code,
             ODSFinanceReport.report_type == '1'
@@ -235,18 +265,28 @@ class DataUpdater:
         
         merged = {}
         for r in reports:
-            if r.end_date not in merged: merged[r.end_date] = {"ann_date": r.ann_date}
+            end_date = r.end_date
+            if end_date not in merged:
+                merged[end_date] = {"ann_date": r.ann_date}
+            
+            # 关键：从 JSONB 中提取字段并覆盖合并 [cite: 847]
             data = r.data
-            # TODO: Use FINANCE_EXTRACT_PIPELINE from mapping.py for industry-specific extraction
             for k in ['revenue', 'n_income_attr_p', 'n_cashflow_act', 'debt_to_assets', 'roe', 'grossprofit_margin']:
-                if k in data: merged[r.end_date][k] = data[k]
+                if k in data and data[k] is not None:
+                    merged[end_date][k] = data[k]
         
         for end_date, m in merged.items():
+            # 必须有公告日期才能进行后续的 merge_asof [cite: 847]
+            if not m.get('ann_date'): continue 
+            
             self.db.merge(DWSFinanceStd(
                 ts_code=ts_code, end_date=end_date, ann_date=m.get('ann_date'),
-                revenue=m.get('revenue'), n_income_attr_p=m.get('n_income_attr_p'),
-                n_cashflow_act=m.get('n_cashflow_act'), debt_to_assets=m.get('debt_to_assets'),
-                roe=m.get('roe'), grossprofit_margin=m.get('grossprofit_margin')
+                revenue=m.get('revenue'),
+                n_income_attr_p=m.get('n_income_attr_p'),
+                n_cashflow_act=m.get('n_cashflow_act'),
+                debt_to_assets=m.get('debt_to_assets'),
+                roe=m.get('roe'),
+                grossprofit_margin=m.get('grossprofit_margin')
             ))
         self.db.commit()
 
