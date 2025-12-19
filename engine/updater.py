@@ -180,37 +180,48 @@ class DataUpdater:
     # --- 场景 S4: 水平每日财报 (按公告日同步) ---
 
     def sync_financial_daily(self, ann_date: str):
-        """[PRD S4] 每日增量财报同步 (水平模式)"""
+        """
+        [PRD S4 修正版] 每日增量财报同步
+        针对 2000 积分优化：通过披露计划反查个股，避免全市场拉取报错
+        """
         universe = self._get_universe_pool()
-        
-        tasks = {
-            "income": (ts_client.fetch_income, "income"),
-            "balancesheet": (ts_client.fetch_balancesheet, "balance"),
-            "cashflow": (ts_client.fetch_cashflow, "cashflow"),
-            "fina_indicator": (ts_client.fetch_fina_indicator, "indicator")
-        }
+        if not universe:
+            return
 
-        for name, (api_func, category) in tasks.items():
-            try:
-                df = api_func(ann_date=ann_date)
-                if df.empty: continue
+        try:
+            # 1. 获取当日实际披露财报的名单 (actual_date)
+            # Ref: Tushare PDF 
+            df_ann = ts_client.pro.disclosure_date(actual_date=ann_date)
+            if df_ann.empty:
+                yield f"  ☕ {ann_date} 无财报披露。"
+                return
 
-                df = df[df['ts_code'].isin(universe)]
-                if df.empty: continue
+            # 2. 筛选出属于我们 Universe 的标的
+            targets = df_ann[df_ann['ts_code'].isin(universe)]['ts_code'].unique().tolist()
+            
+            if not targets:
+                yield f"  ☕ {ann_date} 披露的 {len(df_ann)} 家公司均不在核心池中。"
+                return
 
-                df = df.astype(object).where(pd.notnull(df), None)
-                records = df.to_dict('records')
+            yield f"  📢 发现 {len(targets)} 只核心标的披露财报，开始精准同步..."
 
-                for record in records:
-                    self.db.merge(ODSFinanceReport(
-                        ts_code=record['ts_code'], end_date=record['end_date'],
-                        report_type=record.get('report_type', '1'),
-                        update_flag=record.get('update_flag', '0'),
-                        category=category, data=record, ann_date=record.get('ann_date')
-                    ))
-                self.db.commit()
-            except Exception as e:
-                print(f"  ⚠️ {name} Error: {e}")
+            # 3. 逐个同步个股财报 (复用 S1/S2 的垂直同步逻辑)
+            for i, ts_code in enumerate(targets):
+                yield f"    > [{i+1}/{len(targets)}] 同步财报: {ts_code}"
+                # 此处仅同步公告日前后的数据即可，为保险起见同步最近一年
+                # start_date 设为公告日前一年
+                sync_start = (datetime.strptime(ann_date, "%Y%m%d") - timedelta(days=365)).strftime("%Y%m%d")
+                self.sync_stock_history(ts_code, start_date=sync_start)
+                
+                # 频次保护
+                time.sleep(0.2)
+
+            self.db.commit()
+            yield f"  ✅ {ann_date} 财报增量同步完成。"
+
+        except Exception as e:
+            self.db.rollback()
+            yield f"  ❌ 财报增量同步失败: {str(e)}"
 
     # --- DWS 计算逻辑 ---
 
@@ -314,29 +325,70 @@ class DataUpdater:
         yield "✅ 全量回溯任务完成"
 
     def run_daily_routine(self):
-        """[PRD S3/S4] 日常更新流程"""
-        today = datetime.now().strftime('%Y%m%d')
-        yield f"🚀 Starting Daily Routine for {today}..."
+        """
+        [PRD S3/S4 进化版] 自动区间补全日更
+        逻辑：自动计算断档期并循环补全，确保隔周/隔月更新不漏数据
+        """
+        # 1. 确定补全区间
+        # 查找本地最新行情日期作为起点
+        res = self.db.execute(text("SELECT max(trade_date) FROM ods_market_daily")).fetchone()
+        last_date_str = res[0] if res and res[0] else "20241201" # 默认回溯起点
         
-        yield "Step 1/4: Updating Stock Universe..."
-        self.sync_stock_list()
+        start_date = (datetime.strptime(last_date_str, "%Y%m%d") + timedelta(days=1))
+        end_date = datetime.now()
         
-        yield "Step 2/4: Syncing Market Data..."
-        self.sync_daily_market(today)
-        
-        yield "Step 3/4: Checking Financial Announcements..."
-        self.sync_financial_daily(today)
-        
-        yield "Step 4/4: Recalculating DWS Indicators..."
+        # 获取期间所有交易日 (避免非交易日报错)
+        # 注意：这里调用 tushare 交易日历接口
+        cal = ts_client.pro.trade_cal(exchange='', start_date=start_date.strftime('%Y%m%d'), 
+                                     end_date=end_date.strftime('%Y%m%d'), is_open='1')
+        trade_days = cal['cal_date'].tolist()
+
+        if not trade_days:
+            yield "☕ 数据已是最新，无需更新。"
+            return
+
+        yield f"🚀 发现 {len(trade_days)} 个交易日待补全: {trade_days[0]} -> {trade_days[-1]}"
+
+        # 2. 核心同步循环
+        for date_str in trade_days:
+            yield f"📅 正在处理: {date_str} ..."
+            
+            # A. 同步全市场行情 (S3) 
+            self.sync_daily_market(date_str)
+            
+            # B. 同步每日指标 (PE/PB/市值) - 修正：需手动添加 horizontal 模式
+            yield f"  > 拉取每日指标 (PE/PB)..."
+            df_basic = ts_client.pro.daily_basic(trade_date=date_str)
+            if not df_basic.empty:
+                # 仅存 universe 内的
+                universe = self._get_universe_pool()
+                df_target = df_basic[df_basic['ts_code'].isin(universe)]
+                for _, row in df_target.iterrows():
+                    self.db.merge(ODSDailyBasic(
+                        ts_code=row['ts_code'], trade_date=row['trade_date'],
+                        pe_ttm=row.get('pe_ttm'), pb=row.get('pb'),
+                        total_mv=row.get('total_mv'), turnover_rate=row.get('turnover_rate')
+                    ))
+            
+            # C. 检查并同步当日披露的财报 (S4 修正版)
+            # 这里调用上一张指令卡修复后的 sync_financial_daily
+            # 由于 sync_financial_daily 是生成器，需要遍历它
+            for msg in self.sync_financial_daily(date_str):
+                yield f"    {msg}"
+            
+            self.db.commit()
+            time.sleep(0.5) # 2000积分频次保护 [cite: 345]
+
+        # 3. 统一触发 DWS 重炼 [cite: 140]
+        yield "🔄 正在重新炼制 DWS 衍生指标..."
         universe = list(self._get_universe_pool())
-        total = len(universe)
         for i, ts_code in enumerate(universe):
-            if i % 50 == 0:
-                yield f"  > DWS 计算进度: {i}/{total}..."
             self.process_market_dws(ts_code)
             self.process_finance_dws(ts_code)
-            
-        yield "✅ Daily Routine Completed Successfully!"
+            if i % 100 == 0:
+                yield f"  > 炼制进度: {i}/{len(universe)}"
+        
+        yield "✅ 全区间数据补全并炼制完成！"
 
 if __name__ == "__main__":
     u = DataUpdater()
