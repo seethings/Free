@@ -1,5 +1,5 @@
 # INVEST SYSTEM CONTEXT DUMP
-# Timestamp: 2025-12-20 00:24:14.659124
+# Timestamp: 2025-12-20 02:01:33.193900
 # Security: Sensitive files (.env) and temp dirs are EXCLUDED.
 
 📦 PROJECT STRUCTURE (Ignored: .env, temp/, note/, data/)
@@ -7,9 +7,7 @@
 📂 ROOT/
     📄 .gitignore  # Git忽略规则 [核心]
     📄 requirements.txt  # Python依赖清单 [核心]
-    📄 run_audit_patch.py
     📄 run_backfill.py
-    📄 run_init.py
     📂 ui/
     📂 database/
         📄 models.py  # SQLAlchemy数据库模型(ODS/DWS) [核心]
@@ -17,13 +15,11 @@
         📄 tushare_client.py  # Tushare接口封装(带重试) [核心]
     📂 tools/
         📄 audit_system.py
-        📄 data_exporter.py
         📄 db_inspector.py  # 数据库体检工具 [工具]
-        📄 debug_finance.py
         📄 doc_generator.py  # 上下文生成工具 [工具]
         📄 git_auto.py  # Git自动助理 [工具]
         📄 manage_watchlist.py
-        📄 probe_2024.py
+        📄 report_exporter.py
         📄 reset_db.py
     📂 core/
         📄 config.py  # 全局配置加载器 [核心]
@@ -83,53 +79,6 @@ openpyxl>=3.1.0
 
 
 ------------------------------------------------------------
-FILE PATH: run_audit_patch.py
-------------------------------------------------------------
-import time
-from engine.updater import DataUpdater
-
-def run_audit_patch():
-    print("🚑 === Invest System 数据炼制补丁工具 (Audit Patch) ===")
-    
-    # 强制指定需要“二次炼制”的目标
-    # 600036.SH (验证金融行业感知) | 600519.SH (验证一般工商业)
-    targets = ['600036.SH', '600519.SH'] 
-    
-    updater = DataUpdater()
-    try:
-        print(f"🎯 正在重新处理: {targets}")
-
-        for ts_code in targets:
-            start_time = time.time()
-            print(f"\n--- 正在重炼: {ts_code} ---")
-            
-            try:
-                # 1. 补全原始数据 (如果缺失)
-                print(f"  📥 Step 1: 检查 ODS 原始层 (20150101起)...")
-                updater.sync_stock_history(ts_code, start_date="20150101")
-                
-                # 2. 重新炼制行情 (MA/QFQ/PE/PB)
-                print(f"  📈 Step 2: 重新炼制 DWS 行情指标...")
-                updater.process_market_dws(ts_code) 
-                
-                # 3. 重新炼制财务 (ROE/营收/现金流)
-                print(f"  💰 Step 3: 重新炼制 DWS 财务宽表...")
-                updater.process_finance_dws(ts_code)
-                
-                print(f"  ✅ {ts_code} 炼制完成，耗时: {time.time() - start_time:.2f}s")
-
-            except Exception as e:
-                print(f"  ❌ {ts_code} 失败: {str(e)}")
-
-        print("\n✨ 补丁运行完毕！现在可以执行 python3 tools/data_exporter.py 验收结果。")
-
-    finally:
-        updater.close()
-
-if __name__ == "__main__":
-    run_audit_patch()
-
-------------------------------------------------------------
 FILE PATH: run_backfill.py
 ------------------------------------------------------------
 import time
@@ -186,40 +135,6 @@ def run_industrial_backfill():
 
 if __name__ == "__main__":
     run_industrial_backfill()
-
-------------------------------------------------------------
-FILE PATH: run_init.py
-------------------------------------------------------------
-from engine.updater import DataUpdater
-from database.models import SessionLocal, StockBasic
-
-def start_universe():
-    updater = DataUpdater()
-    try:
-        print("🚀 开始初始化股票池 (Universe Setup)...")
-        
-        # 1. 同步基础列表并标记中证800
-        # 此操作会调用 Tushare 的 stock_basic 和 index_weight 接口 [cite: 73-74]
-        updater.sync_stock_list()
-        
-        # 2. 简单校验
-        db = SessionLocal()
-        total = db.query(StockBasic).count()
-        csi800 = db.query(StockBasic).filter(StockBasic.is_csi800 == True).count()
-        db.close()
-        
-        print(f"\n✅ 初始化完成！")
-        print(f"📊 全市场标的: {total} 只")
-        print(f"💎 中证800成分股: {csi800} 只")
-        print("\n现在你可以运行 python3 tools/db_inspector.py 查看详细体检报告了。")
-        
-    except Exception as e:
-        print(f"❌ 初始化失败: {e}")
-    finally:
-        updater.close()
-
-if __name__ == "__main__":
-    start_universe()
 
 ------------------------------------------------------------
 FILE PATH: database/models.py
@@ -568,81 +483,6 @@ if __name__ == "__main__":
     auditor.run_full_audit()
 
 ------------------------------------------------------------
-FILE PATH: tools/data_exporter.py
-------------------------------------------------------------
-import pandas as pd
-import sys
-import os
-import warnings
-
-warnings.filterwarnings('ignore', category=FutureWarning)
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from database.models import SessionLocal, DWSMarketIndicators, DWSFinanceStd
-from core.mapping import FIELD_MAPPING
-
-def export_audit_excel(ts_code: str):
-    db = SessionLocal()
-    try:
-        # 1. 提取行情与财务数据
-        m_query = db.query(DWSMarketIndicators).filter(DWSMarketIndicators.ts_code == ts_code).statement
-        f_query = db.query(DWSFinanceStd).filter(DWSFinanceStd.ts_code == ts_code).statement
-        
-        df_market = pd.read_sql(m_query, db.bind)
-        df_finance = pd.read_sql(f_query, db.bind)
-
-        if df_market.empty:
-            print(f"⚠️ {ts_code} 行情数据缺失")
-            return
-
-        # --- 核心修复：类型转换 ---
-        # merge_asof 要求 key 必须是 numeric 或 datetime
-        df_market['trade_date_int'] = df_market['trade_date'].astype(int)
-        df_market = df_market.sort_values('trade_date_int')
-        
-        if not df_finance.empty:
-            # 过滤掉公告日期为空的异常数据
-            df_finance = df_finance.dropna(subset=['ann_date'])
-            df_finance['ann_date_int'] = df_finance['ann_date'].astype(int)
-            df_finance = df_finance.sort_values('ann_date_int')
-            
-            # 使用整数化的日期进行模糊对齐
-            df_audit = pd.merge_asof(
-                df_market, 
-                df_finance.drop(columns=['ts_code']), 
-                left_on='trade_date_int', 
-                right_on='ann_date_int',
-                direction='backward'
-            )
-        else:
-            df_audit = df_market
-
-        # 2. 字段过滤与中文翻译
-        available_cols = [col for col in df_audit.columns if col in FIELD_MAPPING]
-        df_final = df_audit[available_cols].copy()
-        df_final.rename(columns=FIELD_MAPPING, inplace=True)
-
-        # 3. 导出
-        if not os.path.exists('temp'): os.makedirs('temp')
-        output_path = f"temp/audit_{ts_code}.xlsx"
-        
-        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-            df_final.sort_values('交易日期', ascending=False).to_excel(writer, index=False)
-            
-        print(f"✅ 审计文件已成功生成: {output_path}")
-
-    except Exception as e:
-        print(f"❌ 导出失败: {e}")
-    finally:
-        db.close()
-
-if __name__ == "__main__":
-    # 再次尝试审计招行与茅台
-    targets = ['600036.SH', '600519.SH']
-    for t in targets:
-        export_audit_excel(t)
-
-------------------------------------------------------------
 FILE PATH: tools/db_inspector.py
 ------------------------------------------------------------
 import sys
@@ -757,52 +597,6 @@ class DBInspectorV2:
 if __name__ == "__main__":
     inspector = DBInspectorV2()
     inspector.run()
-
-------------------------------------------------------------
-FILE PATH: tools/debug_finance.py
-------------------------------------------------------------
-import sys
-import os
-import pandas as pd
-
-# Path setup
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from interface.tushare_client import ts_client
-
-def debug_finance_fetch():
-    print("🕵️‍♂️ === Tushare Finance API Probe ===")
-    ts_code = '600000.SH'
-    start_date = '20230101'
-    end_date = '20240101'
-    
-    print(f"Target: {ts_code} | Range: {start_date} - {end_date}")
-    
-    try:
-        # 1. 直接调用 Client 封装的方法
-        print("\n[Attempt 1] Calling fetch_income...")
-        df = ts_client.fetch_income(ts_code=ts_code, start_date=start_date, end_date=end_date)
-        
-        if df is None:
-            print("❌ Result is None!")
-        elif df.empty:
-            print("⚠️ Result is Empty DataFrame!")
-        else:
-            print(f"✅ Success! Rows fetched: {len(df)}")
-            print("Columns:", df.columns.tolist())
-            print("Sample Row 1:\n", df.iloc[0].to_dict())
-            
-            # 检查关键字段
-            if 'update_flag' in df.columns:
-                print(f"update_flag found: {df['update_flag'].unique()}")
-            else:
-                print("⚠️ Warning: 'update_flag' MISSING in response!")
-
-    except Exception as e:
-        print(f"❌ API Call Failed: {e}")
-
-if __name__ == "__main__":
-    debug_finance_fetch()
 
 ------------------------------------------------------------
 FILE PATH: tools/doc_generator.py
@@ -1188,43 +982,109 @@ if __name__ == "__main__":
     wm.close()
 
 ------------------------------------------------------------
-FILE PATH: tools/probe_2024.py
+FILE PATH: tools/report_exporter.py
 ------------------------------------------------------------
-import sys
+import pandas as pd
 import os
+import sys
 from sqlalchemy import text
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from database.models import SessionLocal
 
-def probe_latest_year():
-    db = SessionLocal()
-    target_period = '20250930'
-    print(f"🕵️‍♂️ 正在专项审计 {target_period} (最新年报期) 的数据完整性...")
-    
-    query = text("""
-        SELECT ts_code, COUNT(DISTINCT category) as cat_count
-        FROM ods_finance_report
-        WHERE end_date = :period AND report_type = '1'
-        GROUP BY ts_code
-    """)
-    
-    results = db.execute(query, {"period": target_period}).fetchall()
-    total = len(results)
-    perfect = len([r for r in results if r.cat_count == 4])
-    
-    print(f"\n📈 审计结果:")
-    print(f"  - 目标标的总数: {total}")
-    print(f"  - 满分标的 (4/4): {perfect}")
-    print(f"  - 数据达成率: {(perfect/total*100 if total > 0 else 0):.2f}%")
-    
-    if perfect < total:
-        print("\n❌ 缺失样本探测 (前5条):")
-        for r in [r for r in results if r.cat_count < 4][:5]:
-            print(f"    - {r.ts_code}: 仅有 {r.cat_count}/4 张报表")
-    db.close()
+# 路径设置：确保可以导入 database 和 core 模块
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from database.models import SessionLocal, StockBasic, DWSMarketIndicators, DWSFinanceStd
+from core.mapping import FIELD_MAPPING
+
+class ReportFactory:
+    def __init__(self, ts_code: str):
+        self.ts_code = ts_code
+        self.db = SessionLocal()
+        self.stock = self.db.query(StockBasic).filter(StockBasic.ts_code == ts_code).first()
+
+    def _calculate_shield_metrics(self, df_f: pd.DataFrame):
+        """
+        [🛡️盾] 维度：核心风险指标二次计算
+        """
+        if df_f.empty:
+            return df_f
+        
+        # 1. 计算净现比 (经营现金流 / 归母净利润)
+        # 处理分母为0的情况
+        df_f['ocf_to_profit'] = df_f.apply(
+            lambda x: x['n_cashflow_act'] / x['n_income_attr_p'] if x['n_income_attr_p'] and x['n_income_attr_p'] != 0 else 0, 
+            axis=1
+        )
+        
+        # 2. 计算商誉占比 (商誉 / 总资产)
+        # 注意：此处需确保 DWSFinanceStd 包含 goodwill 和 total_assets
+        if 'goodwill' in df_f.columns and 'total_assets' in df_f.columns:
+            df_f['goodwill_to_assets'] = df_f['goodwill'] / df_f['total_assets']
+            
+        return df_f
+
+    def fetch_full_dataset(self):
+        """抓取并聚合五大维度数据"""
+        # A. 提取 DWS 财务标准化数据 (含 🏰核、🚀矛、🛡️盾 基础字段) [cite: 25]
+        f_query = self.db.query(DWSFinanceStd).filter(DWSFinanceStd.ts_code == self.ts_code).statement
+        df_f = pd.read_sql(f_query, self.db.bind).sort_values('end_date', ascending=False)
+        
+        # 执行深度诊断计算
+        df_f = self._calculate_shield_metrics(df_f)
+        
+        # B. 提取 DWS 行情指标 (⚖️秤) [cite: 24]
+        m_query = self.db.query(DWSMarketIndicators).filter(DWSMarketIndicators.ts_code == self.ts_code).statement
+        df_m = pd.read_sql(m_query, self.db.bind).sort_values('trade_date', ascending=False)
+        
+        return df_f, df_m
+
+    def generate_excel(self):
+        """生成格式化 Excel 报告"""
+        if not self.stock:
+            print(f"❌ 错误：未在数据库中找到标的 {self.ts_code}")
+            return
+
+        print(f"🚀 正在为 [{self.stock.name}] 生成五维研报工厂数据...")
+        df_f, df_m = self.fetch_full_dataset()
+
+        # 创建导出目录
+        out_dir = "data/reports"
+        if not os.path.exists(out_dir):
+            os.makedirs(out_dir)
+        file_path = f"{out_dir}/Report_{self.ts_code}_{self.stock.name}.xlsx"
+
+        with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
+            # --- Sheet 1: 财务诊断 (🛡️盾、🏰核、🚀矛) ---
+            # 过滤 Mapping 中定义的字段进行导出
+            available_f = [col for col in df_f.columns if col in FIELD_MAPPING]
+            df_f_final = df_f[available_f].rename(columns=FIELD_MAPPING)
+            df_f_final.to_excel(writer, sheet_name='基本面诊断', index=False)
+            
+            # --- Sheet 2: 估值行情 (⚖️秤) ---
+            available_m = [col for col in df_m.columns if col in FIELD_MAPPING]
+            df_m_final = df_m[available_m].head(500).rename(columns=FIELD_MAPPING) # 取最近两年交易日 [cite: 24]
+            df_m_final.to_excel(writer, sheet_name='行情与估值', index=False)
+
+            # --- Sheet 3: 标的信息 (🏗️基) ---
+            df_info = pd.DataFrame([self.stock.__dict__])
+            available_i = [col for col in df_info.columns if col in FIELD_MAPPING]
+            df_info_final = df_info[available_i].rename(columns=FIELD_MAPPING)
+            df_info_final.to_excel(writer, sheet_name='公司基石', index=False)
+            
+        print(f"✅ 报告成功导出至: {file_path}")
+        return file_path
+
+    def close(self):
+        self.db.close()
 
 if __name__ == "__main__":
-    probe_latest_year()
+    # 针对核心标的进行验证 [cite: 4, 5]
+    test_targets = ['600519.SH', '600036.SH']
+    for code in test_targets:
+        factory = ReportFactory(code)
+        try:
+            factory.generate_excel()
+        finally:
+            factory.close()
 
 ------------------------------------------------------------
 FILE PATH: tools/reset_db.py
@@ -1288,12 +1148,16 @@ settings = Config()
 ------------------------------------------------------------
 FILE PATH: core/mapping.py
 ------------------------------------------------------------
-# 字段映射字典 (Key: DB/API Field, Value: Chinese Name)
-# Ref: Tushare Pro 字段字典
+# core/mapping.py
 
-# 1. 业务术语标准化映射 (用于 UI 和 审计)
+# ==============================================================================
+# INVEST SYSTEM MASTER MAPPING V7.1 - 核心映射矩阵
+# ==============================================================================
+
+# 1. 业务术语标准化映射 (用于 UI、Excel 导出及审计)
+# 严格遵循五大维度分类：🏗️基、🛡️盾、🏰核、🚀矛、⚖️秤
 FIELD_MAPPING = {
-    # --- 基础信息 ---
+    # --- 🏗️基 (Base: 基础信息) ---
     "ts_code": "TS代码",
     "symbol": "股票代码",
     "name": "股票名称",
@@ -1302,63 +1166,57 @@ FIELD_MAPPING = {
     "list_date": "上市日期",
     "is_csi800": "中证800",
 
-    # --- 日线行情 (Daily) ---
+    # --- 🛡️盾 (Shield: 风险排雷) ---
+    "debt_to_assets": "资产负债率(%)",
+    "current_ratio": "流动比率",
+    "quick_ratio": "速动比率",
+    "ocf_to_profit": "净现比(经营现金流/净利润)",  # 核心排雷：防止利润造假
+    "goodwill": "商誉",
+    "goodwill_to_assets": "商誉占总资产比(%)",      # 排除鸵鸟资产风险
+    "intan_assets": "无形资产",
+    "money_cap": "货币资金",
+    "st_borr": "短期借款",
+
+    # --- 🏰核 (Core: 商业壁垒与盈利) ---
+    "roe": "ROE(净资产收益率)",
+    "roe_dt": "ROE(扣非)",
+    "grossprofit_margin": "毛利率(%)",
+    "netprofit_margin": "净利率(%)",
+    "roic": "ROIC(投入资本回报率)",
+    "asset_turn": "总资产周转率",
+    "n_income_attr_p": "归母净利润",
+
+    # --- 🚀矛 (Spear: 成长驱动) ---
+    "tr_yoy": "营收同比增长(%)",
+    "netprofit_yoy": "净利同比增长(%)",
+    "dt_netprofit_yoy": "扣非净利同比增长(%)",
+    "contract_liab": "合同负债(蓄水池)",
+    "total_revenue": "营业总收入",
+    "revenue": "营业收入",
+
+    # --- ⚖️秤 (Scale: 估值与行情) ---
     "trade_date": "交易日期",
-    "open": "开盘价",
-    "high": "最高价",
-    "low": "最低价",
-    "close": "收盘价",
-    "pre_close": "昨收价",
-    "change": "涨跌额",
-    "pct_chg": "涨跌幅(%)",
-    "vol": "成交量(手)",
-    "amount": "成交额(千元)",
-    "turnover_rate": "换手率(%)",
+    "close_qfq": "前复权收盘价",
     "pe_ttm": "市盈率(TTM)",
     "pb": "市净率",
     "total_mv": "总市值(万)",
-    "circ_mv": "流通市值(万)",
-
-    # --- 财务核心指标 (Indicator/Income/Cashflow) ---
-    "end_date": "报告期",
-    "ann_date": "公告日期",
-    "report_type": "报表类型",
-    
-    # 利润表 (Income)
-    "total_revenue": "营业总收入",
-    "revenue": "营业收入",
-    "n_income_attr_p": "归母净利润",  # 核心字段
-    "operate_profit": "营业利润",
-    
-    # 资产负债表 (Balance Sheet)
-    "total_assets": "总资产",
-    "total_liab": "负债合计",
-    "total_hldr_eqy_exc_min_int": "股东权益合计(不含少数股东)", # 归母权益
-    "money_cap": "货币资金",
-    
-    # 现金流量表 (Cashflow)
-    "n_cashflow_act": "经营活动现金流",
-    "n_cashflow_inv_act": "投资活动现金净流量",
-    "n_cashflow_fnc_act": "筹资活动现金净流量",
-
-    # 财务指标 (Indicator)
-    "roe": "ROE",
-    "roe_dt": "ROE(扣非)",
-    "grossprofit_margin": "毛利率",
-    "netprofit_margin": "净利率",
-    "debt_to_assets": "资产负债率",
-    "current_ratio": "流动比率",
+    "turnover_rate": "换手率(%)",
+    "ma_20": "20日均线",
+    "ma_250": "250日均线(年线)",
+    "pct_chg": "涨跌幅(%)",
+    "vol": "成交量(手)",
+    "amount": "成交额(千元)",
 }
 
-# 2. 行业感知提取规则 (解决跨表字段对齐的关键！)
-# 逻辑：当我们需要提取某个业务指标时，根据公司所属行业（industry）选择正确的 ODS 字段
+# 2. 行业感知提取规则 (解决跨表字段对齐的关键逻辑) 
+# 逻辑：当系统计算标准化财务宽表时，根据 industry 字段动态选择 ODS 原始字段
 FINANCE_EXTRACT_PIPELINE = {
     "General": { # 一般工商业
         "revenue": ["revenue"],
         "n_income": ["n_income_attr_p"],
         "cash_flow": ["n_cashflow_act"]
     },
-    "Bank": { # 银行 [cite: 634-636]
+    "Bank": { # 银行
         "revenue": ["int_income", "comm_income", "n_oth_b_income"], # 收入 = 利息收入+佣金收入+其他
         "n_income": ["n_income_attr_p"],
         "cash_flow": ["n_cashflow_act"]
@@ -1373,15 +1231,15 @@ FINANCE_EXTRACT_PIPELINE = {
     }
 }
 
-# 3. 接口归属映射 (审计系统使用：知道去哪个表查哪个字段)
+# 3. 接口归属映射 (审计系统与 ReportFactory 使用：确定字段来源) [cite: 983]
 SOURCE_TABLE_MAP = {
-    "income": ["revenue", "int_income", "n_income_attr_p", "prem_earned"],
-    "balancesheet": ["total_assets", "total_liab", "money_cap"],
+    "income": ["revenue", "int_income", "n_income_attr_p", "prem_earned", "total_revenue"],
+    "balancesheet": ["total_assets", "total_liab", "money_cap", "goodwill", "intan_assets", "contract_liab", "st_borr"],
     "cashflow": ["n_cashflow_act", "n_cashflow_fnc_act"],
-    "fina_indicator": ["roe", "debt_to_assets", "grossprofit_margin"]
+    "fina_indicator": ["roe", "debt_to_assets", "grossprofit_margin", "netprofit_margin", "current_ratio", "quick_ratio", "roic"]
 }
 
-# 4. 报表类型映射
+# 4. 报表类型映射 (用于数据清洗过滤) [cite: 1566, 1604, 1627]
 REPORT_TYPE_MAP = {
     "1": "合并报表",
     "6": "母公司报表",
