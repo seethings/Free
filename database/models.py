@@ -152,6 +152,26 @@ class DWSFinanceStd(Base):
     debt_to_assets = Column(Float, comment="资产负债率")
     roe = Column(Float, comment="ROE")
     grossprofit_margin = Column(Float, comment="毛利率")
+    
+    # --- V7.4 新增：审计与防伪物理字段 [关键修复] ---
+    # A. 利润成色
+    ocf_to_net_profit = Column(Float, comment="净现比(经营现金流/归母净利)")
+    
+    # B. 资产水分
+    toxic_asset_ratio = Column(Float, comment="垃圾资产占比(其他应收+预付+待摊)/总资产")
+    
+    # C. 增长匹配
+    ar_rev_gap = Column(Float, comment="应收营收增速差")
+    
+    # D. 泡沫指标
+    goodwill_net_asset_ratio = Column(Float, comment="商誉/归母净资产")
+
+    # --- 辅助计算用的原始科目 ---
+    oth_receiv = Column(Float, comment="其他应收款")
+    prepayment = Column(Float, comment="预付款项")
+    goodwill = Column(Float, comment="商誉")
+    total_assets = Column(Float, comment="资产总计")
+    total_hldr_eqy_exc_min_int = Column(Float, comment="归母净资产")
 
 # --- 工具函数 ---
 def init_db():

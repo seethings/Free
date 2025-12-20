@@ -1,5 +1,5 @@
 # INVEST SYSTEM CONTEXT DUMP
-# Timestamp: 2025-12-20 13:29:09.338202
+# Timestamp: 2025-12-20 23:38:46.633044
 # Security: Sensitive files (.env) and temp dirs are EXCLUDED.
 
 📦 PROJECT STRUCTURE (Ignored: .env, temp/, note/, data/)
@@ -524,6 +524,41 @@ class RadarPage:
         except Exception as e:
             ui.notify(f"导出失败: {str(e)}")
 
+    async def add_to_watchlist(self, event):
+        """处理表格内的‘加入自选’点击事件"""
+        # 仅响应‘操作’列的点击
+        if event.args['colId'] != 'action':
+            return
+        
+        row_data = event.args['data']
+        ts_code = row_data['ts_code']
+        name = row_data['name']
+        
+        # 实例化 DB 会话（注意：RadarPage 目前未持有 db 实例，建议即用即删）
+        from database.models import SessionLocal, Watchlist
+        db = SessionLocal()
+        
+        try:
+            # 检查是否已存在 
+            exists = db.query(Watchlist).filter(Watchlist.ts_code == ts_code).first()
+            if exists:
+                ui.notify(f"⚠️ {name} 已在自选池中", type='warning')
+                return
+                
+            # 写入自选 
+            new_item = Watchlist(
+                ts_code=ts_code, name=name, industry=row_data.get('industry'),
+                group_name='雷达发现', weight=1.0
+            )
+            db.add(new_item)
+            db.commit()
+            ui.notify(f"🌟 已将 {name} 加入自选池", type='positive')
+        except Exception as e:
+            db.rollback()
+            ui.notify(f"添加失败: {str(e)}", type='negative')
+        finally:
+            db.close()
+
     def _create_compact_control(self, label, min_v, max_v, step_v, default_v, unit=""):
         """【架构师重制】优化宽度的水平控制组 """
         with ui.row().classes('items-center gap-3 w-full px-2 py-1 hover:bg-slate-50 rounded transition-all'):
@@ -543,7 +578,8 @@ class RadarPage:
             return slider
 
     def content(self):
-        with ui.column().classes('w-full p-4 max-w-7xl mx-auto gap-4'):
+        # 修改 1：升级为全屏流式布局 (max-w-full)
+        with ui.column().classes('w-full p-6 max-w-full mx-auto gap-6 bg-slate-50'):
             # 顶层头部
             with ui.row().classes('w-full items-center justify-between'):
                 with ui.row().classes('items-center gap-4'):
@@ -570,12 +606,29 @@ class RadarPage:
             with ui.card().props('flat bordered').classes('w-full p-0 overflow-hidden bg-white rounded-lg'):
                 self.grid = ui.aggrid({
                     'columnDefs': [
-                        {'headerName': '代码', 'field': 'ts_code', 'width': 95, 'pinned': 'left'},
-                        {'headerName': '名称', 'field': 'name', 'width': 105, 'pinned': 'left'},
+                        {'headerName': '操作', 'field': 'action', 'width': 70, 'pinned': 'left',
+                         ':cellRenderer': 'params => "⭐"'},
+                        {'headerName': '代码', 'field': 'ts_code', 'width': 100, 'pinned': 'left'},
+                        {'headerName': '名称', 'field': 'name', 'width': 110, 'pinned': 'left'},
+                        {'headerName': '入选理由/风险提示', 'field': 'selection_reason', 'minWidth': 250,
+                         'cellClass': 'text-slate-500 italic text-xs'},
                         {'headerName': '行业', 'field': 'industry', 'width': 130},
-                        {'headerName': 'ROE %', 'field': 'roe', 'width': 90, 'sortable': True, 'cellClass': 'font-bold text-emerald-700'},
+                        {'headerName': 'ROE %', 'field': 'roe', 'width': 90, 'sortable': True, 
+                         ':valueFormatter': 'params => params.value ? params.value.toFixed(2) : "0.00"',
+                         'cellClassRules': {
+                             'bg-emerald-50 text-emerald-700 font-bold': 'x >= 20',
+                             'text-rose-600': 'x < 10'
+                         }},
                         {'headerName': 'PE(TTM)', 'field': 'pe_ttm', 'width': 90, 'sortable': True},
                         {'headerName': 'PB', 'field': 'pb', 'width': 85, 'sortable': True},
+                        {'headerName': '净现比', 'field': 'ocf_to_net_profit', 'width': 90, 'sortable': True,
+                         ':valueFormatter': 'params => params.value ? params.value.toFixed(2) : "0.00"',
+                         'cellClassRules': {
+                             'bg-blue-50 text-blue-700': 'x >= 1.2',
+                             'text-amber-700': 'x < 0.8'
+                         }},
+                        {'headerName': '垃圾资产%', 'field': 'toxic_asset_ratio', 'width': 100, 
+                         ':valueFormatter': 'params => params.value ? (params.value * 100).toFixed(2) + "%" : "0.00%"'},
                         {'headerName': '市值(亿)', 'field': 'total_mv_unit', 'width': 105, 'sortable': True},
                         {'headerName': '今日涨跌', 'field': 'pct_chg', 'width': 100, 'sortable': True, ':cellRenderer': 'p => p.value > 0 ? "🔴 " + p.value + "%" : "🟢 " + p.value + "%"'},
                         {'headerName': '最新财报', 'field': 'last_report', 'width': 105},
@@ -583,8 +636,32 @@ class RadarPage:
                     'rowData': [],
                     'pagination': True,
                     'paginationPageSize': 50,
-                    'theme': 'balham'
-                }).classes('w-full h-[650px]')
+                    'autoSizeStrategy': {'type': 'fitCellContents'},
+                    'theme': 'balham',
+                    'defaultColDef': {'sortable': True, 'filter': True, 'resizable': True} # 允许用户手动调节
+                }).classes('w-full h-[600px] shadow-lg border-none').on('cellClicked', self.add_to_watchlist)
+
+            # 修改 3：升级版“深蓝审计看板”
+            with ui.card().props('flat').classes('w-full bg-slate-900 text-white p-6 rounded-xl'):
+                with ui.row().classes('items-center gap-4'):
+                    ui.icon('security', color='primary').classes('text-3xl')
+                    ui.label('雷达审计逻辑看板 (V7.4 Forensic Edition)').classes('text-xl font-bold tracking-tight')
+                
+                ui.separator().classes('my-4 bg-slate-700')
+                
+                with ui.grid(columns=4).classes('w-full gap-8'):
+                    with ui.column():
+                        ui.label('🛡️ 利润成色').classes('text-blue-400 text-xs font-bold uppercase')
+                        ui.label('净现比 ≥ 0.8 (剔除纸面富贵)').classes('text-sm')
+                    with ui.column():
+                        ui.label('🔍 资产审计').classes('text-blue-400 text-xs font-bold uppercase')
+                        ui.label('垃圾资产 < 5% (严防财务黑洞)').classes('text-sm')
+                    with ui.column():
+                        ui.label('🏰 核心盈利').classes('text-blue-400 text-xs font-bold uppercase')
+                        ui.label(f'ROE (扣非) ≥ {self.roe_slider.value}%').classes('text-sm')
+                    with ui.column():
+                        ui.label('⚖️ 估值边界').classes('text-blue-400 text-xs font-bold uppercase')
+                        ui.label(f'PE ≤ {self.pe_slider.value} | PB ≤ {self.pb_slider.value}').classes('text-sm')
 
             ui.timer(0.5, self.update_data, once=True)
 
@@ -893,6 +970,26 @@ class DWSFinanceStd(Base):
     debt_to_assets = Column(Float, comment="资产负债率")
     roe = Column(Float, comment="ROE")
     grossprofit_margin = Column(Float, comment="毛利率")
+    
+    # --- V7.4 新增：审计与防伪物理字段 [关键修复] ---
+    # A. 利润成色
+    ocf_to_net_profit = Column(Float, comment="净现比(经营现金流/归母净利)")
+    
+    # B. 资产水分
+    toxic_asset_ratio = Column(Float, comment="垃圾资产占比(其他应收+预付+待摊)/总资产")
+    
+    # C. 增长匹配
+    ar_rev_gap = Column(Float, comment="应收营收增速差")
+    
+    # D. 泡沫指标
+    goodwill_net_asset_ratio = Column(Float, comment="商誉/归母净资产")
+
+    # --- 辅助计算用的原始科目 ---
+    oth_receiv = Column(Float, comment="其他应收款")
+    prepayment = Column(Float, comment="预付款项")
+    goodwill = Column(Float, comment="商誉")
+    total_assets = Column(Float, comment="资产总计")
+    total_hldr_eqy_exc_min_int = Column(Float, comment="归母净资产")
 
 # --- 工具函数 ---
 def init_db():
@@ -1786,6 +1883,11 @@ FIELD_MAPPING = {
     "roic": "ROIC(投入资本回报率)",
     "asset_turn": "总资产周转率",
     "n_income_attr_p": "归母净利润",
+    "ocf_to_net_profit": "净现比(现金流/净利)",
+    "toxic_asset_ratio": "垃圾资产占比(%)",
+    "goodwill_net_asset_ratio": "商誉占比(%)",
+    "ar_rev_gap": "应收营收增速差(%)",
+    "selection_reason": "入选理由/风险提示",
 
     # --- 🚀矛 (Spear: 成长驱动) ---
     "tr_yoy": "营收同比增长(%)",
@@ -1887,7 +1989,13 @@ class RadarEngine:
                 m.pct_chg,
                 f.end_date as last_report, 
                 COALESCE(f.roe, 0) as roe, -- 这里暂时取 f.roe，我们将修改 process_finance_dws 来填充它
-                f.debt_to_assets
+                f.debt_to_assets,
+                -- V7.4 侦探指标计算 
+                COALESCE(f.n_cashflow_act / NULLIF(f.n_income_attr_p, 0), 0) as ocf_to_net_profit,
+                -- 垃圾资产比: (其他应收+预付) / 总资产
+                COALESCE((f.oth_receiv + f.prepayment) / NULLIF(f.total_assets, 0), 0) as toxic_asset_ratio,
+                -- 商誉占比: 商誉 / 归母净资产
+                COALESCE(f.goodwill / NULLIF(f.total_hldr_eqy_exc_min_int, 0), 0) as goodwill_net_asset_ratio
             FROM stock_basic b
             JOIN dws_market_indicators i ON b.ts_code = i.ts_code
             JOIN ods_market_daily m ON i.ts_code = m.ts_code AND i.trade_date = m.trade_date
@@ -1911,6 +2019,9 @@ class RadarEngine:
         df['roe'] = df['roe'].fillna(0)
         df['debt_to_assets'] = df['debt_to_assets'].fillna(0)
         df['pe_ttm'] = df['pe_ttm'].fillna(999) # PE 缺失则设为极大值拦截
+        df['ocf_to_net_profit'] = df['ocf_to_net_profit'].fillna(0)
+        df['toxic_asset_ratio'] = df['toxic_asset_ratio'].fillna(0)
+        df['goodwill_net_asset_ratio'] = df['goodwill_net_asset_ratio'].fillna(0)
 
         # 3. 执行多因子过滤
         mask = (
@@ -1918,16 +2029,39 @@ class RadarEngine:
             (df['pb'] < max_pb) &
             (df['total_mv'] >= min_mv * 10000) & # 亿元转万元
             (df['roe'] >= min_roe) &
-            (df['debt_to_assets'] <= max_debt)
+            (df['debt_to_assets'] <= max_debt) &
+            (df['ocf_to_net_profit'] >= 0.8) & 
+            (df['toxic_asset_ratio'] < 0.05) & 
+            (df['goodwill_net_asset_ratio'] < 0.25)
         )
         
         if trend_up:
             mask = mask & (df['close_qfq'] > df['ma_20'])
 
         result = df[mask].copy()
+
+        # --- V7.4 动态理由生成 ---
+        def generate_reason(row):
+            reasons = []
+            # 亮点挖掘
+            if row['roe'] >= 20: reasons.append("高ROE(>20%)")
+            if row['ocf_to_net_profit'] >= 1.2: reasons.append("现金含量极高")
+            
+            # 风险提示
+            if row['goodwill_net_asset_ratio'] > 0.2: reasons.append("⚠商誉偏高")
+            if row['toxic_asset_ratio'] > 0.04: reasons.append("⚠资产成色一般")
+            
+            return " | ".join(reasons) if reasons else "多因子均衡"
+
+        result['selection_reason'] = result.apply(generate_reason, axis=1)
         
         # 格式化输出
         result['total_mv_unit'] = (result['total_mv'] / 10000).round(2) # 转回亿元显示
+        
+        # 统一保留两位小数
+        numeric_cols = result.select_dtypes(include=['number']).columns
+        result[numeric_cols] = result[numeric_cols].round(2)
+
         return result.sort_values('roe', ascending=False)
 
     def close(self):
@@ -2227,7 +2361,7 @@ class DataUpdater:
         self.db.commit()
 
     def process_finance_dws(self, ts_code: str):
-        """[核心修复] 炼制时自动合并 roe 与 roe_dt"""
+        """[核心修复] 炼制时自动合并 roe 与 roe_dt，并计算审计指标"""
         reports = self.db.query(ODSFinanceReport).filter(
             ODSFinanceReport.ts_code == ts_code,
             ODSFinanceReport.report_type == '1'
@@ -2240,40 +2374,64 @@ class DataUpdater:
                 merged[end_date] = {"ann_date": r.ann_date}
             
             data = r.data
-            for k in ['revenue', 'n_income_attr_p', 'n_cashflow_act', 'grossprofit_margin']:
+            # 提取基础字段
+            fields = [
+                'revenue', 'n_income_attr_p', 'n_cashflow_act', 'grossprofit_margin',
+                'oth_receiv', 'prepayment', 'goodwill', 'total_assets', 'total_hldr_eqy_exc_min_int',
+                'debt_to_assets', 'roe', 'roe_dt', 'total_liab'
+            ]
+            for k in fields:
                 if k in data and data[k] is not None:
                     merged[end_date][k] = data[k]
-            
-            # --- 增强：负债率多路径提取 ---
-            debt_ratio = data.get('debt_to_assets')
-            if debt_ratio is None:
-                # 尝试通过 总负债(total_liab) / 总资产(total_assets) 计算
-                liab = data.get('total_liab')
-                assets = data.get('total_assets')
-                if liab and assets and assets != 0:
-                    debt_ratio = (liab / assets) * 100
-            
-            if debt_ratio is not None:
-                merged[end_date]['debt_to_assets'] = debt_ratio
-
-            # --- 关键逻辑：扣非 ROE 优先级 ---
-            # 优先取 roe_dt (扣非)，如果没有，取 roe (加权)
-            roe_final = data.get('roe_dt') if data.get('roe_dt') is not None else data.get('roe')
-            if roe_final is not None:
-                merged[end_date]['roe'] = roe_final
         
         for end_date, m in merged.items():
             # 必须有公告日期才能进行后续的 merge_asof [cite: 847]
             if not m.get('ann_date'): continue 
             
+            # 1. 准备计算数据 (利用 .get 容错)
+            net_profit = m.get('n_income_attr_p', 0) or 0
+            ocf = m.get('n_cashflow_act', 0) or 0
+            oth_receiv = m.get('oth_receiv', 0) or 0
+            prepay = m.get('prepayment', 0) or 0
+            assets = m.get('total_assets', 0) or 0
+            goodwill = m.get('goodwill', 0) or 0
+            equity = m.get('total_hldr_eqy_exc_min_int', 0) or 0
+            
+            # 2. 计算审计指标
+            # 净现比
+            ocf_ratio = ocf / net_profit if net_profit and net_profit != 0 else 0
+            # 垃圾资产占比
+            toxic_ratio = (oth_receiv + prepay) / assets if assets and assets != 0 else 0
+            # 商誉占比
+            gw_ratio = goodwill / equity if equity and equity != 0 else 0
+            
+            # 3. 负债率多路径提取
+            debt_ratio = m.get('debt_to_assets')
+            if debt_ratio is None:
+                liab = m.get('total_liab')
+                if liab and assets and assets != 0:
+                    debt_ratio = (liab / assets) * 100
+            
+            # 4. ROE 优先级
+            roe_final = m.get('roe_dt') if m.get('roe_dt') is not None else m.get('roe')
+
             self.db.merge(DWSFinanceStd(
                 ts_code=ts_code, end_date=end_date, ann_date=m.get('ann_date'),
                 revenue=m.get('revenue'),
                 n_income_attr_p=m.get('n_income_attr_p'),
                 n_cashflow_act=m.get('n_cashflow_act'),
-                debt_to_assets=m.get('debt_to_assets'),
-                roe=m.get('roe'),
-                grossprofit_margin=m.get('grossprofit_margin')
+                debt_to_assets=debt_ratio,
+                roe=roe_final,
+                grossprofit_margin=m.get('grossprofit_margin'),
+                oth_receiv=m.get('oth_receiv'),
+                prepayment=m.get('prepayment'),
+                goodwill=m.get('goodwill'),
+                total_assets=m.get('total_assets'),
+                total_hldr_eqy_exc_min_int=m.get('total_hldr_eqy_exc_min_int'),
+                # 存入物理字段
+                ocf_to_net_profit=round(ocf_ratio, 4),
+                toxic_asset_ratio=round(toxic_ratio, 4),
+                goodwill_net_asset_ratio=round(gw_ratio, 4)
             ))
         self.db.commit()
 

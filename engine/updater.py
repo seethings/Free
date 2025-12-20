@@ -289,7 +289,7 @@ class DataUpdater:
         self.db.commit()
 
     def process_finance_dws(self, ts_code: str):
-        """[核心修复] 炼制时自动合并 roe 与 roe_dt"""
+        """[核心修复] 炼制时自动合并 roe 与 roe_dt，并计算审计指标"""
         reports = self.db.query(ODSFinanceReport).filter(
             ODSFinanceReport.ts_code == ts_code,
             ODSFinanceReport.report_type == '1'
@@ -302,40 +302,64 @@ class DataUpdater:
                 merged[end_date] = {"ann_date": r.ann_date}
             
             data = r.data
-            for k in ['revenue', 'n_income_attr_p', 'n_cashflow_act', 'grossprofit_margin']:
+            # 提取基础字段
+            fields = [
+                'revenue', 'n_income_attr_p', 'n_cashflow_act', 'grossprofit_margin',
+                'oth_receiv', 'prepayment', 'goodwill', 'total_assets', 'total_hldr_eqy_exc_min_int',
+                'debt_to_assets', 'roe', 'roe_dt', 'total_liab'
+            ]
+            for k in fields:
                 if k in data and data[k] is not None:
                     merged[end_date][k] = data[k]
-            
-            # --- 增强：负债率多路径提取 ---
-            debt_ratio = data.get('debt_to_assets')
-            if debt_ratio is None:
-                # 尝试通过 总负债(total_liab) / 总资产(total_assets) 计算
-                liab = data.get('total_liab')
-                assets = data.get('total_assets')
-                if liab and assets and assets != 0:
-                    debt_ratio = (liab / assets) * 100
-            
-            if debt_ratio is not None:
-                merged[end_date]['debt_to_assets'] = debt_ratio
-
-            # --- 关键逻辑：扣非 ROE 优先级 ---
-            # 优先取 roe_dt (扣非)，如果没有，取 roe (加权)
-            roe_final = data.get('roe_dt') if data.get('roe_dt') is not None else data.get('roe')
-            if roe_final is not None:
-                merged[end_date]['roe'] = roe_final
         
         for end_date, m in merged.items():
             # 必须有公告日期才能进行后续的 merge_asof [cite: 847]
             if not m.get('ann_date'): continue 
             
+            # 1. 准备计算数据 (利用 .get 容错)
+            net_profit = m.get('n_income_attr_p', 0) or 0
+            ocf = m.get('n_cashflow_act', 0) or 0
+            oth_receiv = m.get('oth_receiv', 0) or 0
+            prepay = m.get('prepayment', 0) or 0
+            assets = m.get('total_assets', 0) or 0
+            goodwill = m.get('goodwill', 0) or 0
+            equity = m.get('total_hldr_eqy_exc_min_int', 0) or 0
+            
+            # 2. 计算审计指标
+            # 净现比
+            ocf_ratio = ocf / net_profit if net_profit and net_profit != 0 else 0
+            # 垃圾资产占比
+            toxic_ratio = (oth_receiv + prepay) / assets if assets and assets != 0 else 0
+            # 商誉占比
+            gw_ratio = goodwill / equity if equity and equity != 0 else 0
+            
+            # 3. 负债率多路径提取
+            debt_ratio = m.get('debt_to_assets')
+            if debt_ratio is None:
+                liab = m.get('total_liab')
+                if liab and assets and assets != 0:
+                    debt_ratio = (liab / assets) * 100
+            
+            # 4. ROE 优先级
+            roe_final = m.get('roe_dt') if m.get('roe_dt') is not None else m.get('roe')
+
             self.db.merge(DWSFinanceStd(
                 ts_code=ts_code, end_date=end_date, ann_date=m.get('ann_date'),
                 revenue=m.get('revenue'),
                 n_income_attr_p=m.get('n_income_attr_p'),
                 n_cashflow_act=m.get('n_cashflow_act'),
-                debt_to_assets=m.get('debt_to_assets'),
-                roe=m.get('roe'),
-                grossprofit_margin=m.get('grossprofit_margin')
+                debt_to_assets=debt_ratio,
+                roe=roe_final,
+                grossprofit_margin=m.get('grossprofit_margin'),
+                oth_receiv=m.get('oth_receiv'),
+                prepayment=m.get('prepayment'),
+                goodwill=m.get('goodwill'),
+                total_assets=m.get('total_assets'),
+                total_hldr_eqy_exc_min_int=m.get('total_hldr_eqy_exc_min_int'),
+                # 存入物理字段
+                ocf_to_net_profit=round(ocf_ratio, 4),
+                toxic_asset_ratio=round(toxic_ratio, 4),
+                goodwill_net_asset_ratio=round(gw_ratio, 4)
             ))
         self.db.commit()
 
