@@ -1,5 +1,5 @@
 # INVEST SYSTEM CONTEXT DUMP
-# Timestamp: 2025-12-20 02:56:23.658608
+# Timestamp: 2025-12-20 09:07:11.875658
 # Security: Sensitive files (.env) and temp dirs are EXCLUDED.
 
 📦 PROJECT STRUCTURE (Ignored: .env, temp/, note/, data/)
@@ -193,8 +193,9 @@ FILE PATH: ui/layout.py
 from nicegui import ui
 
 def theme_setup():
-    """全局样式初始化"""
-    ui.colors(primary='#1976d2', secondary='#26a69a', accent='#9c27b0')
+    # 采用更冷静的极简配色：深灰蓝 (#37474f)
+    ui.colors(primary='#37474f', secondary='#eceff1', accent='#607d8b')
+    ui.query('body').style('font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #f8fafc;')
 
 def shared_menu():
     """侧边栏导航组件"""
@@ -231,61 +232,56 @@ class ConsolePage:
         self.updater = DataUpdater()
         self.log_view = None
 
-    async def run_task(self, task_func, *args):
-        """通用任务运行器，支持异步和生成器"""
+    async def run_task(self, task_func):
         if self.log_view:
-            self.log_view.push(f"[{datetime.now().strftime('%H:%M:%S')}] 🚀 启动任务...")
-        
-        try:
-            # 检查是否为生成器函数 (yield)
-            result = task_func(*args)
-            if hasattr(result, '__iter__'):
-                for message in result:
-                    self.log_view.push(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
-                    await asyncio.sleep(0.01)
-            else:
-                # 普通函数直接执行
-                self.log_view.push(f"[{datetime.now().strftime('%H:%M:%S')}] 执行中...")
-                # 注意：此处暂不处理耗时极长的同步函数，未来可放入线程池
-        except Exception as e:
-            self.log_view.push(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ 错误: {str(e)}")
+            self.log_view.push(f"[{datetime.now().strftime('%H:%M:%S')}] 🚀 启动...")
+        for message in task_func():
+            self.log_view.push(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+            await asyncio.sleep(0.01)
 
     def content(self):
-        with ui.column().classes('w-full p-6'):
-            ui.label('⚙️ 系统控制台').classes('text-2xl font-bold mb-4')
+        with ui.column().classes('w-full p-8 max-w-6xl mx-auto'):
+            ui.label('⚙️ 系统控制台').classes('text-3xl font-light text-slate-700 mb-8')
             
-            # 操作区：Grid 布局对齐 PRD 3.2
-            with ui.row().classes('w-full gap-4'):
+            # 极简磁贴布局
+            with ui.row().classes('w-full gap-6'):
                 
-                # 磁贴 1: 日常同步 (S3/S4)
-                with ui.card().classes('p-4 w-64 hover:shadow-lg border-l-4 border-blue-500'):
-                    ui.label('收盘自动化 (S3/S4)').classes('font-bold text-gray-700')
+                # 场景 S3/S4
+                with ui.card().props('flat bordered').classes('p-6 flex-1 bg-white'):
+                    ui.label('日常同步').classes('text-xs text-slate-400 uppercase tracking-widest')
+                    ui.label('收盘数据补全').classes('text-lg font-medium mb-4')
                     ui.button('一键日更', on_click=lambda: self.run_task(self.updater.run_daily_routine)) \
-                        .props('unelevated color=blue')
+                        .props('flat color=primary').classes('px-4 border border-slate-200') \
+                        .tooltip('同步全市场最新行情、每日指标及当日披露的财报 (S3/S4)')
 
-                # 磁贴 2: 成分股维护
-                with ui.card().classes('p-4 w-64 hover:shadow-lg border-l-4 border-teal-500'):
-                    ui.label('指数成分股同步').classes('font-bold text-gray-700')
+                # 磁贴 2: 元数据同步 (CSI800)
+                with ui.card().props('flat bordered').classes('p-6 flex-1 bg-white'):
+                    ui.label('底座维护').classes('text-xs text-slate-400 uppercase tracking-widest')
+                    ui.label('同步成分股').classes('text-lg font-medium mb-4')
                     ui.button('同步 CSI800', on_click=lambda: self.run_task(self.updater.sync_stock_list)) \
-                        .props('unelevated color=teal')
+                        .props('flat color=primary').classes('px-4 border border-slate-200') \
+                        .tooltip('更新全市场股票清单并重新标记中证800成分股状态')
 
-                # 磁贴 3: 自选股修补 (S1/S2)
-                with ui.card().classes('p-4 w-64 hover:shadow-lg border-l-4 border-orange-500'):
-                    ui.label('自选池修补 (S1/S2)').classes('font-bold text-gray-700')
-                    # 这里封装一个简单的逻辑来遍历自选股并同步
-                    ui.button('修补自选数据', on_click=lambda: ui.notify('该功能将调用 sync_stock_history')) \
-                        .props('outline color=orange')
-
-                # 磁贴 4: 初始化 (S5)
-                with ui.card().classes('p-4 w-64 hover:shadow-lg border-l-4 border-red-500'):
-                    ui.label('全量初始化 (S5)').classes('font-bold text-gray-700')
+                # 磁贴 3: 初始化 (S5)
+                with ui.card().props('flat bordered').classes('p-6 flex-1 bg-white'):
+                    ui.label('初始化').classes('text-xs text-slate-400 uppercase tracking-widest')
+                    ui.label('核心池全回溯').classes('text-lg font-medium mb-4')
                     ui.button('开始回溯', on_click=lambda: self.run_task(self.updater.run_full_backfill)) \
-                        .props('unelevated color=red')
+                        .props('flat color=primary').classes('px-4 border border-slate-200') \
+                        .tooltip('针对中证800个股，从2015年起补全所有历史财务与行情数据 (S5)')
 
-            # 日志终端
-            ui.label('📡 实时执行日志').classes('text-lg font-semibold mt-8')
-            with ui.card().classes('w-full p-0 overflow-hidden'):
-                self.log_view = ui.log().classes('w-full h-96 bg-gray-900 text-green-400 font-mono text-xs p-4')
+                # 磁贴 4: 自选维护 (S1/S2)
+                with ui.card().props('flat bordered').classes('p-6 flex-1 bg-white'):
+                    ui.label('专项同步').classes('text-xs text-slate-400 uppercase tracking-widest')
+                    ui.label('自选数据修补').classes('text-lg font-medium mb-4')
+                    ui.button('立即修补', on_click=lambda: ui.notify('专项功能开发中...')) \
+                        .props('flat color=primary').classes('px-4 border border-slate-200') \
+                        .tooltip('检查并补全自选股池中个股的历史数据断档 (S1/S2)')
+
+            # 极简日志区
+            ui.label('📡 实时日志').classes('text-sm font-medium text-slate-500 mt-12 mb-2')
+            with ui.card().props('flat').classes('w-full bg-slate-900 overflow-hidden rounded-lg'):
+                self.log_view = ui.log().classes('w-full h-80 text-emerald-400 font-mono text-[11px] p-6')
 
 ------------------------------------------------------------
 FILE PATH: database/models.py
@@ -1427,47 +1423,38 @@ class DataUpdater:
         return pool
 
     def sync_stock_list(self):
-        """[PRD 3.1] 全量同步股票列表并标记中证800"""
-        print("🔄 Syncing Stock List...")
+        """[PRD 3.1] 全量同步股票列表并标记中证800 (UI 适配版)"""
+        yield "🔄 正在从 Tushare 获取全市场基础列表..."
         df_basics = ts_client.fetch_stock_basic()
-        if df_basics.empty: return
+        if df_basics.empty: 
+            yield "❌ 获取失败：Tushare 返回为空。"
+            return
 
-        # Mark CSI 800
+        yield "💎 正在获取中证800最新成分股名单..."
         try:
             now_str = datetime.now().strftime("%Y%m%d")
             df_csi800 = ts_client.pro.index_weight(index_code='000906.SH', start_date='20240101', end_date=now_str)
-            
             if not df_csi800.empty:
                 latest_date = df_csi800['trade_date'].max()
-                df_latest = df_csi800[df_csi800['trade_date'] == latest_date]
-                csi800_set = set(df_latest['con_code'].tolist())
+                csi800_set = set(df_csi800[df_csi800['trade_date'] == latest_date]['con_code'].tolist())
             else:
                 csi800_set = set()
         except Exception as e:
-            print(f"⚠️ CSI800 Fetch Error: {e}")
+            yield f"⚠️ 指数获取异常: {e}"
             csi800_set = set()
 
-        # Processing
-        df_basics['is_csi800'] = False
-        if csi800_set:
-            df_basics.loc[df_basics['ts_code'].isin(csi800_set), 'is_csi800'] = True
-
-        # Upsert Logic
+        yield f"📥 正在写入数据库 (共 {len(df_basics)} 条记录)..."
         for _, row in df_basics.iterrows():
+            is_in_index = row['ts_code'] in csi800_set
             stock = StockBasic(
-                ts_code=row['ts_code'],
-                symbol=row['symbol'],
-                name=row['name'],
-                area=row['area'],
-                industry=row['industry'],
-                market=row['market'],
-                list_date=row['list_date'],
-                is_csi800=row['is_csi800']
+                ts_code=row['ts_code'], symbol=row['symbol'], name=row['name'],
+                area=row['area'], industry=row['industry'], market=row['market'],
+                list_date=row['list_date'], is_csi800=is_in_index
             )
             self.db.merge(stock)
         
         self.db.commit()
-        print(f"✅ Stock List Synced. CSI800 Count: {len(csi800_set)}")
+        yield f"✅ 股票列表同步完成！已识别中证800成分股: {len(csi800_set)} 只。"
 
     # --- 场景 S1/S2/S5: 垂直历史回溯 (按代码同步) ---
 
@@ -1708,7 +1695,7 @@ class DataUpdater:
     def run_full_backfill(self, start_date="20150101"):
         """[PRD S5] 核心池财务与行情全量初始化"""
         yield "🚀 开始全量回溯 (Full Backfill)..."
-        self.sync_stock_list()
+        yield from self.sync_stock_list()
         
         universe = list(self._get_universe_pool())
         total = len(universe)

@@ -10,58 +10,53 @@ class ConsolePage:
         self.updater = DataUpdater()
         self.log_view = None
 
-    async def run_task(self, task_func, *args):
-        """通用任务运行器，支持异步和生成器"""
+    async def run_task(self, task_func):
         if self.log_view:
-            self.log_view.push(f"[{datetime.now().strftime('%H:%M:%S')}] 🚀 启动任务...")
-        
-        try:
-            # 检查是否为生成器函数 (yield)
-            result = task_func(*args)
-            if hasattr(result, '__iter__'):
-                for message in result:
-                    self.log_view.push(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
-                    await asyncio.sleep(0.01)
-            else:
-                # 普通函数直接执行
-                self.log_view.push(f"[{datetime.now().strftime('%H:%M:%S')}] 执行中...")
-                # 注意：此处暂不处理耗时极长的同步函数，未来可放入线程池
-        except Exception as e:
-            self.log_view.push(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ 错误: {str(e)}")
+            self.log_view.push(f"[{datetime.now().strftime('%H:%M:%S')}] 🚀 启动...")
+        for message in task_func():
+            self.log_view.push(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+            await asyncio.sleep(0.01)
 
     def content(self):
-        with ui.column().classes('w-full p-6'):
-            ui.label('⚙️ 系统控制台').classes('text-2xl font-bold mb-4')
+        with ui.column().classes('w-full p-8 max-w-6xl mx-auto'):
+            ui.label('⚙️ 系统控制台').classes('text-3xl font-light text-slate-700 mb-8')
             
-            # 操作区：Grid 布局对齐 PRD 3.2
-            with ui.row().classes('w-full gap-4'):
+            # 极简磁贴布局
+            with ui.row().classes('w-full gap-6'):
                 
-                # 磁贴 1: 日常同步 (S3/S4)
-                with ui.card().classes('p-4 w-64 hover:shadow-lg border-l-4 border-blue-500'):
-                    ui.label('收盘自动化 (S3/S4)').classes('font-bold text-gray-700')
+                # 场景 S3/S4
+                with ui.card().props('flat bordered').classes('p-6 flex-1 bg-white'):
+                    ui.label('日常同步').classes('text-xs text-slate-400 uppercase tracking-widest')
+                    ui.label('收盘数据补全').classes('text-lg font-medium mb-4')
                     ui.button('一键日更', on_click=lambda: self.run_task(self.updater.run_daily_routine)) \
-                        .props('unelevated color=blue')
+                        .props('flat color=primary').classes('px-4 border border-slate-200') \
+                        .tooltip('同步全市场最新行情、每日指标及当日披露的财报 (S3/S4)')
 
-                # 磁贴 2: 成分股维护
-                with ui.card().classes('p-4 w-64 hover:shadow-lg border-l-4 border-teal-500'):
-                    ui.label('指数成分股同步').classes('font-bold text-gray-700')
+                # 磁贴 2: 元数据同步 (CSI800)
+                with ui.card().props('flat bordered').classes('p-6 flex-1 bg-white'):
+                    ui.label('底座维护').classes('text-xs text-slate-400 uppercase tracking-widest')
+                    ui.label('同步成分股').classes('text-lg font-medium mb-4')
                     ui.button('同步 CSI800', on_click=lambda: self.run_task(self.updater.sync_stock_list)) \
-                        .props('unelevated color=teal')
+                        .props('flat color=primary').classes('px-4 border border-slate-200') \
+                        .tooltip('更新全市场股票清单并重新标记中证800成分股状态')
 
-                # 磁贴 3: 自选股修补 (S1/S2)
-                with ui.card().classes('p-4 w-64 hover:shadow-lg border-l-4 border-orange-500'):
-                    ui.label('自选池修补 (S1/S2)').classes('font-bold text-gray-700')
-                    # 这里封装一个简单的逻辑来遍历自选股并同步
-                    ui.button('修补自选数据', on_click=lambda: ui.notify('该功能将调用 sync_stock_history')) \
-                        .props('outline color=orange')
-
-                # 磁贴 4: 初始化 (S5)
-                with ui.card().classes('p-4 w-64 hover:shadow-lg border-l-4 border-red-500'):
-                    ui.label('全量初始化 (S5)').classes('font-bold text-gray-700')
+                # 磁贴 3: 初始化 (S5)
+                with ui.card().props('flat bordered').classes('p-6 flex-1 bg-white'):
+                    ui.label('初始化').classes('text-xs text-slate-400 uppercase tracking-widest')
+                    ui.label('核心池全回溯').classes('text-lg font-medium mb-4')
                     ui.button('开始回溯', on_click=lambda: self.run_task(self.updater.run_full_backfill)) \
-                        .props('unelevated color=red')
+                        .props('flat color=primary').classes('px-4 border border-slate-200') \
+                        .tooltip('针对中证800个股，从2015年起补全所有历史财务与行情数据 (S5)')
 
-            # 日志终端
-            ui.label('📡 实时执行日志').classes('text-lg font-semibold mt-8')
-            with ui.card().classes('w-full p-0 overflow-hidden'):
-                self.log_view = ui.log().classes('w-full h-96 bg-gray-900 text-green-400 font-mono text-xs p-4')
+                # 磁贴 4: 自选维护 (S1/S2)
+                with ui.card().props('flat bordered').classes('p-6 flex-1 bg-white'):
+                    ui.label('专项同步').classes('text-xs text-slate-400 uppercase tracking-widest')
+                    ui.label('自选数据修补').classes('text-lg font-medium mb-4')
+                    ui.button('立即修补', on_click=lambda: ui.notify('专项功能开发中...')) \
+                        .props('flat color=primary').classes('px-4 border border-slate-200') \
+                        .tooltip('检查并补全自选股池中个股的历史数据断档 (S1/S2)')
+
+            # 极简日志区
+            ui.label('📡 实时日志').classes('text-sm font-medium text-slate-500 mt-12 mb-2')
+            with ui.card().props('flat').classes('w-full bg-slate-900 overflow-hidden rounded-lg'):
+                self.log_view = ui.log().classes('w-full h-80 text-emerald-400 font-mono text-[11px] p-6')

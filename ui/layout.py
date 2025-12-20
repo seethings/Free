@@ -1,8 +1,9 @@
 from nicegui import ui
 
 def theme_setup():
-    """全局样式初始化"""
-    ui.colors(primary='#1976d2', secondary='#26a69a', accent='#9c27b0')
+    # 采用更冷静的极简配色：深灰蓝 (#37474f)
+    ui.colors(primary='#37474f', secondary='#eceff1', accent='#607d8b')
+    ui.query('body').style('font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #f8fafc;')
 
 def shared_menu():
     """侧边栏导航组件"""

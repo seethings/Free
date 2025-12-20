@@ -25,47 +25,38 @@ class DataUpdater:
         return pool
 
     def sync_stock_list(self):
-        """[PRD 3.1] 全量同步股票列表并标记中证800"""
-        print("🔄 Syncing Stock List...")
+        """[PRD 3.1] 全量同步股票列表并标记中证800 (UI 适配版)"""
+        yield "🔄 正在从 Tushare 获取全市场基础列表..."
         df_basics = ts_client.fetch_stock_basic()
-        if df_basics.empty: return
+        if df_basics.empty: 
+            yield "❌ 获取失败：Tushare 返回为空。"
+            return
 
-        # Mark CSI 800
+        yield "💎 正在获取中证800最新成分股名单..."
         try:
             now_str = datetime.now().strftime("%Y%m%d")
             df_csi800 = ts_client.pro.index_weight(index_code='000906.SH', start_date='20240101', end_date=now_str)
-            
             if not df_csi800.empty:
                 latest_date = df_csi800['trade_date'].max()
-                df_latest = df_csi800[df_csi800['trade_date'] == latest_date]
-                csi800_set = set(df_latest['con_code'].tolist())
+                csi800_set = set(df_csi800[df_csi800['trade_date'] == latest_date]['con_code'].tolist())
             else:
                 csi800_set = set()
         except Exception as e:
-            print(f"⚠️ CSI800 Fetch Error: {e}")
+            yield f"⚠️ 指数获取异常: {e}"
             csi800_set = set()
 
-        # Processing
-        df_basics['is_csi800'] = False
-        if csi800_set:
-            df_basics.loc[df_basics['ts_code'].isin(csi800_set), 'is_csi800'] = True
-
-        # Upsert Logic
+        yield f"📥 正在写入数据库 (共 {len(df_basics)} 条记录)..."
         for _, row in df_basics.iterrows():
+            is_in_index = row['ts_code'] in csi800_set
             stock = StockBasic(
-                ts_code=row['ts_code'],
-                symbol=row['symbol'],
-                name=row['name'],
-                area=row['area'],
-                industry=row['industry'],
-                market=row['market'],
-                list_date=row['list_date'],
-                is_csi800=row['is_csi800']
+                ts_code=row['ts_code'], symbol=row['symbol'], name=row['name'],
+                area=row['area'], industry=row['industry'], market=row['market'],
+                list_date=row['list_date'], is_csi800=is_in_index
             )
             self.db.merge(stock)
         
         self.db.commit()
-        print(f"✅ Stock List Synced. CSI800 Count: {len(csi800_set)}")
+        yield f"✅ 股票列表同步完成！已识别中证800成分股: {len(csi800_set)} 只。"
 
     # --- 场景 S1/S2/S5: 垂直历史回溯 (按代码同步) ---
 
@@ -306,7 +297,7 @@ class DataUpdater:
     def run_full_backfill(self, start_date="20150101"):
         """[PRD S5] 核心池财务与行情全量初始化"""
         yield "🚀 开始全量回溯 (Full Backfill)..."
-        self.sync_stock_list()
+        yield from self.sync_stock_list()
         
         universe = list(self._get_universe_pool())
         total = len(universe)
