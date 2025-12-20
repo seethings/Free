@@ -1,0 +1,2534 @@
+# INVEST SYSTEM CONTEXT DUMP
+# Timestamp: 2025-12-21 01:51:10.676805
+# Security: Sensitive files (.env) and temp dirs are EXCLUDED.
+
+📦 PROJECT STRUCTURE (Ignored: .env, temp/, note/, data/)
+==================================================
+📂 ROOT/
+    📄 .gitignore  # Git忽略规则 [核心]
+    📄 debug_stock.py
+    📄 main.py
+    📄 requirements.txt  # Python依赖清单 [核心]
+    📄 run_backfill.py
+    📄 test_radar.py
+    📄 test_sync_engine.py
+    📂 ui/
+        📄 __init__.py
+        📄 layout.py
+        📂 pages/
+            📄 __init__.py
+            📄 console.py
+            📄 radar.py
+            📄 watchlist.py
+    📂 database/
+        📄 models.py  # SQLAlchemy数据库模型(ODS/DWS) [核心]
+    📂 interface/
+        📄 tushare_client.py  # Tushare接口封装(带重试) [核心]
+    📂 tools/
+        📄 audit_system.py
+        📄 db_inspector.py  # 数据库体检工具 [工具]
+        📄 doc_generator.py  # 上下文生成工具 [工具]
+        📄 git_auto.py  # Git自动助理 [工具]
+        📄 manage_watchlist.py
+        📄 report_exporter.py
+        📄 reset_db.py
+    📂 core/
+        📄 config.py  # 全局配置加载器 [核心]
+        📄 mapping.py  # 中英文映射字典 [核心]
+    📂 engine/
+        📄 radar.py
+        📄 updater.py  # 数据更新引擎 [核心]
+==================================================
+
+💻 CODE CONTENT
+==================================================
+
+------------------------------------------------------------
+FILE PATH: .gitignore
+------------------------------------------------------------
+# System
+.DS_Store
+*.log
+__pycache__/
+
+# Python
+venv/
+*.pyc
+
+# Configuration & Secrets (绝对不能上传!)
+.env
+core/__pycache__
+
+# IDE
+.vscode/
+.idea/
+
+# Data (可选，如果不想上传临时下载的数据)
+data/*
+!data/.gitkeep
+
+------------------------------------------------------------
+FILE PATH: debug_stock.py
+------------------------------------------------------------
+# FILE PATH: debug_stock.py
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.dirname(__file__)))
+from database.models import SessionLocal, DWSMarketIndicators, DWSFinanceStd, StockBasic
+from sqlalchemy import func
+
+def debug_haier():
+    db = SessionLocal()
+    ts_code = '600690.SH'
+    
+    # 1. 检查基础标记
+    basic = db.query(StockBasic).filter(StockBasic.ts_code == ts_code).first()
+    print(f"🏗️ 基础检查: {ts_code} | 名称: {basic.name if basic else '未找到'}")
+
+    # 2. 检查 DWS 行情指标 (取最新一条)
+    market = db.query(DWSMarketIndicators).filter(DWSMarketIndicators.ts_code == ts_code)\
+               .order_by(DWSMarketIndicators.trade_date.desc()).first()
+    if market:
+        print(f"⚖️ 行情检查: 日期={market.trade_date}, PE={market.pe_ttm}, PB={market.pb}, 市值={market.total_mv}")
+    else:
+        print("❌ 行情检查: DWSMarketIndicators 中无数据")
+
+    # 3. 检查 DWS 标准财务 (取最新一条)
+    finance = db.query(DWSFinanceStd).filter(DWSFinanceStd.ts_code == ts_code)\
+                .order_by(DWSFinanceStd.end_date.desc()).first()
+    if finance:
+        print(f"🏰 财务检查: 报告期={finance.end_date}, ROE={finance.roe}, 负债率={finance.debt_to_assets}")
+    else:
+        print("❌ 财务检查: DWSFinanceStd 中无数据")
+    
+    db.close()
+
+if __name__ == "__main__":
+    debug_haier()
+
+------------------------------------------------------------
+FILE PATH: main.py
+------------------------------------------------------------
+# FILE PATH: main.py
+from nicegui import ui
+from ui.layout import theme_setup, shared_menu
+from ui.pages.console import ConsolePage
+from ui.pages.watchlist import WatchlistPage
+from ui.pages.radar import RadarPage
+
+# --- 注意：全局作用域严禁出现 ui.xxx 组件调用 ---
+
+@ui.page('/')
+def index_page():
+    theme_setup()   # 移动到函数内部
+    shared_menu()
+    # 实例化并渲染“数据维护”页面内容
+    ConsolePage().content()
+
+@ui.page('/radar')
+def radar_page():
+    theme_setup()   # 移动到函数内部
+    shared_menu()
+    # 实例化并渲染“选股雷达”页面内容
+    RadarPage().content()
+
+@ui.page('/watchlist')
+def watchlist_page():
+    theme_setup()   # 移动到函数内部
+    shared_menu()
+    # 实例化并渲染“自选管理”页面内容
+    WatchlistPage().content()
+
+# --- 核心修复：修改启动守卫 ---
+# 允许 NiceGUI 的多进程 (Multiprocessing) 和重载机制正常运行
+if __name__ in {"__main__", "__mp_main__"}:
+    ui.run(
+        title='Invest System V7.3',
+        port=8080,
+        reload=True,  # 开启热重载，方便我们实时调试 UI
+        dark=False
+    )
+
+------------------------------------------------------------
+FILE PATH: requirements.txt
+------------------------------------------------------------
+# Data Source
+tushare>=1.2.89
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Database (PostgreSQL + SQLAlchemy 2.0)
+SQLAlchemy>=2.0.0
+psycopg2-binary>=2.9.0
+
+# UI Framework
+nicegui>=1.4.0
+
+# Utilities
+python-dotenv>=1.0.0
+pyyaml>=6.0
+openpyxl>=3.1.0
+
+
+------------------------------------------------------------
+FILE PATH: run_backfill.py
+------------------------------------------------------------
+import time
+from engine.updater import DataUpdater
+from database.models import SessionLocal, StockBasic
+
+def run_industrial_backfill():
+    print("🏗️ === Invest System V7.3 全量历史回溯启动 ===")
+    print("📅 目标起点: 2015-01-01 | 🎯 目标池: CSI800 + Watchlist")
+    
+    updater = DataUpdater()
+    try:
+        # 1. 确保 Universe 名单是最新的
+        print("\nStep 1: 更新标的名单与中证800标记...")
+        updater.sync_stock_list()
+        
+        # 2. 获取所有需要回溯的标的
+        universe = list(updater._get_universe_pool())
+        total = len(universe)
+        print(f"\nStep 2: 准备处理共 {total} 只核心标的...")
+
+        for i, ts_code in enumerate(universe):
+            start_time = time.time()
+            print(f"\n--- [{i+1}/{total}] 正在深度处理: {ts_code} ---")
+            
+            try:
+                # A. 垂直补全 ODS 原始数据 (行情 + 四大财报)
+                print(f"  📥 正在抓取 2015 至今原始数据...")
+                updater.sync_stock_history(ts_code, start_date="20150101")
+                
+                # B. 炼制 DWS 行情指标 (QFQ + MA均线)
+                print(f"  📈 正在计算 QFQ 行情与均线...")
+                updater.process_market_dws(ts_code) 
+                
+                # C. 炼制 DWS 财务宽表 (标准化 + 行业感知)
+                print(f"  💰 正在执行标准化财务炼制...")
+                updater.process_finance_dws(ts_code)
+                
+                elapsed = time.time() - start_time
+                print(f"  ✅ {ts_code} 处理完成，耗时: {elapsed:.2f}s")
+                
+                # 频次保护：2000积分账户每分钟限200次，每只股票处理完强制休息 0.5s
+                time.sleep(0.5)
+
+            except Exception as e:
+                print(f"  ❌ {ts_code} 处理失败: {str(e)}")
+                continue
+
+        print("\n🎉 === 全量历史回溯任务圆满完成！ ===")
+        print("💡 建议运行 python3 tools/audit_system.py 进行最终质量审计。")
+
+    finally:
+        updater.close()
+
+if __name__ == "__main__":
+    run_industrial_backfill()
+
+------------------------------------------------------------
+FILE PATH: test_radar.py
+------------------------------------------------------------
+# FILE PATH: test_radar.py
+import sys
+import os
+
+# 1. 路径防御：确保脚本能识别根目录下的模块
+sys.path.append(os.path.abspath(os.path.dirname(__file__)))
+
+from engine.radar import RadarEngine
+
+def run_radar_smoke_test():
+    print("📡 === 选股雷达后端引擎 (B阶段) 冒烟测试 ===")
+    
+    # 2. 初始化引擎
+    engine = RadarEngine()
+    
+    try:
+        # 3. 传入 Coach 设定的典型参数进行回测
+        # 参数含义：ROE > 10%, PE < 25, 仅限中证800池
+        print("🔍 正在扫描中证800成份股 (基于 T-1 数据)...")
+        picks = engine.query(
+            min_roe=10.0, 
+            max_pe=25.0, 
+            pool='CSI800',
+            trend_up=True  # 过滤掉 20 日均线以下的标的
+        )
+        
+        # 4. 结果验证
+        if picks.empty:
+            print("⚠️ 未找到符合条件的标的，请检查：")
+            print("   - 数据库 DWS 表是否有数据？")
+            print("   - 筛选标准是否过严？")
+        else:
+            print(f"🎯 扫描成功！发现 {len(picks)} 只符合标准的“黄金标的”：")
+            # 打印前 10 名，查看关键指标对齐情况
+            print("-" * 80)
+            print(picks[['ts_code', 'name', 'roe', 'pe_ttm', 'total_mv_unit', 'last_report']].head(10))
+            print("-" * 80)
+
+    except Exception as e:
+        print(f"❌ 引擎运行报错: {str(e)}")
+    finally:
+        engine.close()
+
+if __name__ == "__main__":
+    run_radar_smoke_test()
+
+------------------------------------------------------------
+FILE PATH: test_sync_engine.py
+------------------------------------------------------------
+# FILE PATH: test_sync_engine.py
+import sys
+import os
+
+# 确保能加载项目模块
+sys.path.append(os.path.abspath(os.path.dirname(__file__)))
+
+from engine.updater import DataUpdater
+from database.models import SessionLocal, ODSMarketDaily, ODSFinanceReport, DWSMarketIndicators, DWSFinanceStd
+from sqlalchemy import func
+
+def run_test_sync(ts_code='600519.SH'):
+    print(f"🧪 === Invest System 引擎冒烟测试: {ts_code} ===")
+    updater = DataUpdater()
+    db = SessionLocal()
+
+    try:
+        # 1. 清理该标的既有数据 (为了测试纯净性)
+        print(f"🧹 正在清理 {ts_code} 的旧数据...")
+        db.query(ODSMarketDaily).filter(ODSMarketDaily.ts_code == ts_code).delete()
+        db.query(ODSFinanceReport).filter(ODSFinanceReport.ts_code == ts_code).delete()
+        db.commit()
+
+        # 2. 模拟 S1/S2 同步过程
+        print(f"📥 正在同步 ODS 原始数据 (从 2015-01-01 起)...")
+        # 备注：由于是生成器，这里模拟 UI 调用循环
+        updater.sync_stock_history(ts_code, start_date="20150101")
+        
+        # 3. 验证 ODS 落地情况
+        daily_count = db.query(ODSMarketDaily).filter(ODSMarketDaily.ts_code == ts_code).count()
+        finance_count = db.query(ODSFinanceReport).filter(ODSFinanceReport.ts_code == ts_code).count()
+        print(f"✅ ODS 落地检查：行情 {daily_count} 行, 财报 {finance_count} 份。")
+
+        # 4. 执行 DWS 炼制
+        print(f"⚙️ 正在执行 DWS 层衍生指标计算...")
+        updater.process_market_dws(ts_code)
+        updater.process_finance_dws(ts_code)
+
+        # 5. 验证 DWS 产出
+        latest_ma = db.query(DWSMarketIndicators).filter(DWSMarketIndicators.ts_code == ts_code).order_by(DWSMarketIndicators.trade_date.desc()).first()
+        std_finance = db.query(DWSFinanceStd).filter(DWSFinanceStd.ts_code == ts_code).count()
+        
+        if latest_ma:
+            print(f"📈 DWS 行情检查：最新收盘价(QFQ): {latest_ma.close_qfq:.2f}, MA250: {latest_ma.ma_250 or '计算中'}")
+        print(f"💰 DWS 财务检查：已炼制标准化财报 {std_finance} 条。")
+
+        if daily_count > 0 and finance_count > 0:
+            print("\n🎉 === 测试通过：同步引擎链路已打通！ ===")
+        else:
+            print("\n❌ === 测试失败：未获取到有效数据，请检查 Tushare Token 和网络 === ")
+
+    finally:
+        db.close()
+        updater.close()
+
+if __name__ == "__main__":
+    # 如果要测试多只标的，可以在此修改
+    run_test_sync('600519.SH')
+
+------------------------------------------------------------
+FILE PATH: ui/__init__.py
+------------------------------------------------------------
+
+
+------------------------------------------------------------
+FILE PATH: ui/layout.py
+------------------------------------------------------------
+from nicegui import ui
+
+def theme_setup():
+    # 采用更冷静的极简配色：深灰蓝 (#37474f)
+    ui.colors(primary='#37474f', secondary='#eceff1', accent='#607d8b')
+    ui.query('body').style('font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #f8fafc;')
+
+def shared_menu():
+    """侧边栏导航组件 - 边距增强版"""
+    with ui.left_drawer(value=True).classes('bg-slate-50').props('bordered'):
+        # 标志区
+        ui.label('🏗️ INVEST SYSTEM').classes('text-lg font-bold mt-8 mb-4 ml-10 text-blue-900 tracking-tight')
+        ui.separator().classes('mx-6')
+        
+        # 导航菜单
+        with ui.column().classes('w-full mt-6 gap-2'):
+            # 增加 pl-10 (约 40px) 的左侧内边距，确保文字左对齐且有呼吸感
+            ui.button('数据维护', icon='settings', on_click=lambda: ui.navigate.to('/')) \
+                .props('flat no-caps').classes('w-full justify-start pl-10 text-slate-600 hover:text-blue-700 font-medium')
+            
+            ui.button('选股雷达', icon='radar', on_click=lambda: ui.navigate.to('/radar')) \
+                .props('flat no-caps').classes('w-full justify-start pl-10 text-slate-600 hover:text-blue-700 font-medium')
+            
+            ui.button('自选管理', icon='star_border', on_click=lambda: ui.navigate.to('/watchlist')) \
+                .props('flat no-caps').classes('w-full justify-start pl-10 text-slate-600 hover:text-blue-700 font-medium')
+            
+            ui.button('个股透视', icon='insights', on_click=lambda: ui.navigate.to('/stock')) \
+                .props('flat no-caps').classes('w-full justify-start pl-10 text-slate-600 hover:text-blue-700 font-medium')
+        
+        # 底部状态
+        with ui.column().classes('absolute-bottom w-full p-6 text-slate-400 text-[10px]'):
+            ui.label('V7.3 Architect Edition')
+            ui.label('DB FRESHNESS: 2025-12-19') # 动态日期可后续实装
+
+------------------------------------------------------------
+FILE PATH: ui/pages/__init__.py
+------------------------------------------------------------
+
+
+------------------------------------------------------------
+FILE PATH: ui/pages/console.py
+------------------------------------------------------------
+# FILE PATH: ui/pages/console.py
+
+from nicegui import ui
+from engine.updater import DataUpdater
+import asyncio
+from datetime import datetime
+
+class ConsolePage:
+    def __init__(self):
+        self.updater = DataUpdater()
+        self.log_view = None
+
+    async def run_task(self, task_func):
+        """通用异步任务处理器"""
+        if self.log_view:
+            self.log_view.push(f"[{datetime.now().strftime('%H:%M:%S')}] 🚀 启动...")
+        try:
+            # 这里的 task_func 是 updater 中的生成器函数
+            for message in task_func():
+                self.log_view.push(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+                # 强制 UI 刷新，防止日志堆积导致的浏览器卡顿
+                await asyncio.sleep(0.01)
+        except Exception as e:
+            self.log_view.push(f"❌ 运行异常: {str(e)}")
+
+    def content(self):
+        with ui.column().classes('w-full p-8 max-w-6xl mx-auto'):
+            # 标题更名：从“系统控制台”改为“数据维护”
+            ui.label('⚙️ 数据维护').classes('text-3xl font-light text-slate-700 mb-8')
+            
+            # 四磁贴布局 (对齐你的截图样式)
+            with ui.row().classes('w-full gap-6'):
+                
+                # 磁贴 1: 日常同步 (S3/S4)
+                with ui.card().props('flat bordered').classes('p-6 flex-1 bg-white'):
+                    ui.label('日常同步').classes('text-xs text-slate-400 uppercase tracking-widest')
+                    ui.label('收盘数据补全').classes('text-lg font-medium mb-4')
+                    ui.button('一键日更', on_click=lambda: self.run_task(self.updater.run_daily_routine)) \
+                        .props('flat color=primary').classes('px-4 border border-slate-200')
+
+                # 磁贴 2: 元数据同步 (CSI800)
+                with ui.card().props('flat bordered').classes('p-6 flex-1 bg-white'):
+                    ui.label('底座维护').classes('text-xs text-slate-400 uppercase tracking-widest')
+                    ui.label('同步成分股').classes('text-lg font-medium mb-4')
+                    ui.button('同步 CSI800', on_click=lambda: self.run_task(self.updater.sync_stock_list)) \
+                        .props('flat color=primary').classes('px-4 border border-slate-200')
+
+                # 磁贴 3: 初始化 (S5)
+                with ui.card().props('flat bordered').classes('p-6 flex-1 bg-white'):
+                    ui.label('初始化').classes('text-xs text-slate-400 uppercase tracking-widest')
+                    ui.label('核心池全回溯').classes('text-lg font-medium mb-4')
+                    ui.button('开始回溯', on_click=lambda: self.run_task(self.updater.run_full_backfill)) \
+                        .props('flat color=primary').classes('px-4 border border-slate-200')
+
+                # 磁贴 4: 专项同步 (S1/S2) - 修正点
+                with ui.card().props('flat bordered').classes('p-6 flex-1 bg-white'):
+                    ui.label('专项同步').classes('text-xs text-slate-400 uppercase tracking-widest')
+                    ui.label('自选池深度同步').classes('text-lg font-medium mb-4')
+                    ui.button('立即同步自选池', on_click=lambda: self.run_task(self.updater.run_watchlist_backfill)) \
+                        .props('flat color=primary').classes('px-4 border border-slate-200')
+
+            # 极简日志区
+            ui.label('📡 实时日志').classes('text-sm font-medium text-slate-500 mt-12 mb-2')
+            with ui.card().props('flat').classes('w-full bg-slate-900 overflow-hidden rounded-lg'):
+                self.log_view = ui.log().classes('w-full h-80 text-emerald-400 font-mono text-[11px] p-6')
+
+------------------------------------------------------------
+FILE PATH: ui/pages/radar.py
+------------------------------------------------------------
+# FILE PATH: ui/pages/radar.py
+from nicegui import ui
+from engine.radar import RadarEngine
+import pandas as pd
+import json
+import os
+from datetime import datetime
+from core.mapping import FIELD_MAPPING
+
+class RadarPage:
+    def __init__(self):
+        self.engine = RadarEngine()
+        self.grid = None
+        self.stats_label = None
+        self.current_df = pd.DataFrame()
+
+    def update_data(self):
+        """核心交互逻辑"""
+        try:
+            df = self.engine.query(
+                min_roe=float(self.roe_slider.value),
+                max_pe=float(self.pe_slider.value),
+                max_pb=float(self.pb_slider.value),
+                min_mv=float(self.mv_slider.value),
+                pool=self.pool_select.value,
+                trend_up=self.trend_toggle.value
+            )
+            self.current_df = df
+
+            # 1. 强制将所有空值(NaN)和无穷大(Inf)替换为 0
+            df = df.replace([float('inf'), float('-inf')], 0).fillna(0)
+            # 2. 然后再把这个干净的 df 传给表格
+            records = df.to_dict('records')
+            
+            if self.stats_label:
+                count = len(records)
+                self.stats_label.set_text(f"🎯 雷达发现: {count} 只标的")
+                self.stats_label.classes('text-emerald-600' if count > 0 else 'text-rose-600', remove='text-rose-600 text-emerald-600')
+
+            if self.grid:
+                self.grid.options['rowData'] = records
+                self.grid.update()
+        except Exception as e:
+            ui.notify(f"扫描异常: {str(e)}", type='negative')
+
+    def get_export_path(self):
+        """Chrome 风格导出路径"""
+        downloads_path = os.path.join(os.path.expanduser("~"), "Downloads")
+        target_dir = os.path.join(downloads_path, "InvestSystem_Exports")
+        os.makedirs(target_dir, exist_ok=True)
+        return target_dir
+
+    def export_data(self):
+        """导出结果"""
+        if self.current_df.empty:
+            ui.notify("结果为空", type='warning')
+            return
+        try:
+            target_dir = self.get_export_path()
+            filename = f"Radar_Picks_{datetime.now().strftime('%m%d_%H%M')}.xlsx"
+            filepath = os.path.join(target_dir, filename)
+            available_cols = [col for col in self.current_df.columns if col in FIELD_MAPPING]
+            export_df = self.current_df[available_cols].rename(columns=FIELD_MAPPING)
+            export_df.to_excel(filepath, index=False)
+            ui.notify(f"🚀 已导出: {filename}", type='positive')
+        except Exception as e:
+            ui.notify(f"导出失败: {str(e)}")
+
+    async def add_to_watchlist(self, event):
+        """处理表格内的‘加入自选’点击事件"""
+        # 仅响应‘操作’列的点击
+        if event.args['colId'] != 'action':
+            return
+        
+        row_data = event.args['data']
+        ts_code = row_data['ts_code']
+        name = row_data['name']
+        
+        # 实例化 DB 会话（注意：RadarPage 目前未持有 db 实例，建议即用即删）
+        from database.models import SessionLocal, Watchlist
+        db = SessionLocal()
+        
+        try:
+            # 检查是否已存在 
+            exists = db.query(Watchlist).filter(Watchlist.ts_code == ts_code).first()
+            if exists:
+                ui.notify(f"⚠️ {name} 已在自选池中", type='warning')
+                return
+                
+            # 写入自选 
+            new_item = Watchlist(
+                ts_code=ts_code, name=name, industry=row_data.get('industry'),
+                group_name='雷达发现', weight=1.0
+            )
+            db.add(new_item)
+            db.commit()
+            ui.notify(f"🌟 已将 {name} 加入自选池", type='positive')
+        except Exception as e:
+            db.rollback()
+            ui.notify(f"添加失败: {str(e)}", type='negative')
+        finally:
+            db.close()
+
+    def _create_compact_control(self, label, min_v, max_v, step_v, default_v, unit=""):
+        """【架构师重制】优化宽度的水平控制组 """
+        with ui.row().classes('items-center gap-3 w-full px-2 py-1 hover:bg-slate-50 rounded transition-all'):
+            # 标签区
+            ui.label(label).classes('text-[11px] font-bold text-slate-400 uppercase w-12 leading-tight')
+            # 滑块区
+            slider = ui.slider(min=min_v, max=max_v, step=step_v, value=default_v).classes('flex-grow')
+            # 数字框 (扩容至 w-24，并增加外边距)
+            number = ui.number(value=default_v, min=min_v, max=max_v, step=step_v, format='%.1f') \
+                .props('dense outlined size=10').classes('w-24 text-[12px] bg-white') \
+                .bind_value(slider, 'value')
+            
+            ui.label(unit).classes('text-[10px] text-slate-400 w-4')
+            
+            slider.on_value_change(self.update_data)
+            number.on_value_change(self.update_data)
+            return slider
+
+    def content(self):
+        # 布局调整：左右各留 15% 空间 (max-w-[70vw])
+        with ui.column().classes('w-full mx-auto px-4 py-8 items-center').style('max-width: 60vw'):
+            # 顶层头部
+            with ui.row().classes('w-full items-center justify-between'):
+                with ui.row().classes('items-center gap-4'):
+                    ui.label('📡 选股雷达').classes('text-2xl font-light text-slate-700')
+                    self.pool_select = ui.select(
+                        options={'CSI800': '中证800', 'Watchlist': '自选池', 'All': '全市场'},
+                        value='CSI800'
+                    ).props('dense flat').classes('w-32').on_value_change(self.update_data)
+                    self.trend_toggle = ui.switch('趋势向上', value=False).props('dense').on_value_change(self.update_data)
+                
+                with ui.row().classes('gap-3'):
+                    self.stats_label = ui.label('正在预热...').classes('text-sm font-bold font-mono py-1')
+                    ui.button(icon='download', on_click=self.export_data).props('flat round dense').tooltip('导出 Excel')
+
+            # 2. 战略参数区
+            with ui.card().props('flat bordered').classes('w-full p-2 bg-white rounded-lg shadow-sm'):
+                with ui.grid(columns=4).classes('w-full divide-x divide-slate-100'):
+                    self.roe_slider = self._create_compact_control('ROE%', 0, 40, 0.5, 10)
+                    self.pe_slider = self._create_compact_control('PE', 1, 100, 1, 25)
+                    self.pb_slider = self._create_compact_control('PB', 0.1, 10, 0.1, 3)
+                    self.mv_slider = self._create_compact_control('市值', 0, 5000, 50, 100, "亿")
+
+            # 3. 结果网格
+            with ui.card().props('flat bordered').classes('w-full p-0 overflow-hidden bg-white rounded-lg'):
+                self.grid = ui.aggrid({
+                    'columnDefs': [
+                        {'headerName': '操作', 'field': 'action', 'width': 70, 'pinned': 'left',
+                         ':cellRenderer': 'params => "⭐"'},
+                        {'headerName': '代码', 'field': 'ts_code', 'width': 100, 'pinned': 'left'},
+                        {'headerName': '名称', 'field': 'name', 'width': 110, 'pinned': 'left'},
+                        {'headerName': '入选理由/风险提示', 'field': 'selection_reason', 'minWidth': 250,
+                         'cellClass': 'text-slate-500 italic text-xs'},
+                        {'headerName': '行业', 'field': 'industry', 'width': 130},
+                        {'headerName': 'ROE %', 'field': 'roe', 'width': 90, 'sortable': True, 
+                         ':valueFormatter': 'params => params.value ? params.value.toFixed(2) : "0.00"',
+                         'cellClassRules': {
+                             'bg-emerald-50 text-emerald-700 font-bold': 'x >= 20',
+                             'text-rose-600': 'x < 10'
+                         }},
+                        {'headerName': 'PE(TTM)', 'field': 'pe_ttm', 'width': 90, 'sortable': True},
+                        {'headerName': 'PB', 'field': 'pb', 'width': 85, 'sortable': True},
+                        {'headerName': '净现比', 'field': 'ocf_to_net_profit', 'width': 90, 'sortable': True,
+                         ':valueFormatter': 'params => params.value ? params.value.toFixed(2) : "0.00"',
+                         'cellClassRules': {
+                             'bg-blue-50 text-blue-700': 'x >= 1.2',
+                             'text-amber-700': 'x < 0.8'
+                         }},
+                        {'headerName': '垃圾资产%', 'field': 'toxic_asset_ratio', 'width': 100, 
+                         ':valueFormatter': 'params => params.value ? (params.value * 100).toFixed(2) + "%" : "0.00%"'},
+                        {'headerName': '市值(亿)', 'field': 'total_mv_unit', 'width': 105, 'sortable': True},
+                        {'headerName': '今日涨跌', 'field': 'pct_chg', 'width': 100, 'sortable': True, ':cellRenderer': 'p => p.value > 0 ? "🔴 " + p.value + "%" : "🟢 " + p.value + "%"'},
+                        {'headerName': '最新财报', 'field': 'last_report', 'width': 105},
+                    ],
+                    'rowData': [],
+                    'pagination': True,
+                    'paginationPageSize': 50,
+                    'autoSizeStrategy': {'type': 'fitCellContents'},
+                    'theme': 'balham',
+                    'defaultColDef': {'sortable': True, 'filter': True, 'resizable': True} # 允许用户手动调节
+                }).classes('w-full h-[600px] shadow-lg border-none').on('cellClicked', self.add_to_watchlist)
+
+            # 修改 3：升级版“深蓝审计看板”
+            with ui.card().props('flat').classes('w-full bg-slate-900 text-white p-6 rounded-xl'):
+                with ui.row().classes('items-center gap-4'):
+                    ui.icon('security', color='primary').classes('text-3xl')
+                    ui.label('雷达审计逻辑').classes('text-xl font-bold tracking-tight')
+                
+                ui.separator().classes('my-4 bg-slate-700')
+                
+                with ui.grid(columns=4).classes('w-full gap-8'):
+                    with ui.column():
+                        ui.label('🛡️ 利润成色').classes('text-blue-400 text-xs font-bold uppercase')
+                        ui.label('净现比 ≥ 0.8 (剔除纸面富贵)').classes('text-sm')
+                    with ui.column():
+                        ui.label('🔍 资产审计').classes('text-blue-400 text-xs font-bold uppercase')
+                        ui.label('垃圾资产 < 5% (严防财务黑洞)').classes('text-sm')
+                    with ui.column():
+                        ui.label('🏰 核心盈利').classes('text-blue-400 text-xs font-bold uppercase')
+                        ui.label(f'ROE (扣非) ≥ {self.roe_slider.value}%').classes('text-sm')
+                    with ui.column():
+                        ui.label('⚖️ 估值边界').classes('text-blue-400 text-xs font-bold uppercase')
+                        ui.label(f'PE ≤ {self.pe_slider.value} | PB ≤ {self.pb_slider.value}').classes('text-sm')
+
+            ui.timer(0.5, self.update_data, once=True)
+
+------------------------------------------------------------
+FILE PATH: ui/pages/watchlist.py
+------------------------------------------------------------
+from nicegui import ui
+from database.models import SessionLocal, Watchlist, StockBasic
+from core.mapping import FIELD_MAPPING
+from datetime import datetime
+from sqlalchemy import or_
+
+class WatchlistPage:
+    def __init__(self):
+        self.db = SessionLocal()
+        self.grid = None
+        # 预加载股票字典用于搜索提示 (代码 + 名称)
+        self.stock_options = self._get_search_options()
+
+    def _get_search_options(self):
+        """缓存全量股票列表用于下拉提示"""
+        stocks = self.db.query(StockBasic).all()
+        return {s.ts_code: f"{s.symbol} | {s.name}" for s in stocks}
+
+    def _fetch_data(self):
+        """读取数据并按权重排序 """
+        rows = self.db.query(Watchlist).order_by(Watchlist.weight.desc()).all()
+        return [
+            {
+                'ts_code': r.ts_code,
+                'name': r.name,
+                'industry': r.industry,
+                'group_name': r.group_name or '默认',
+                'weight': r.weight,
+                'add_time': r.add_time.strftime('%Y-%m-%d')
+            } for r in rows
+        ]
+
+    async def update_cell(self, event):
+        """行内编辑同步至数据库"""
+        row_data = event.args['data']
+        field = event.args['colId']
+        new_val = event.args['newValue']
+        
+        target = self.db.query(Watchlist).filter(Watchlist.ts_code == row_data['ts_code']).first()
+        if target:
+            setattr(target, field, new_val)
+            self.db.commit()
+            ui.notify(f"已更新 {target.name} 的{field}")
+
+    async def add_stock(self, value):
+        """增强版添加逻辑：处理下拉选择的值或手动输入的值"""
+        if not value:
+            return
+            
+        # 如果用户选的是提示项，value 是 ts_code；如果是盲打输入，value 也是字符串
+        ts_code = value.upper().strip()
+        
+        # 基础校验与写入逻辑 (复用之前逻辑)
+        basic = self.db.query(StockBasic).filter(StockBasic.ts_code == ts_code).first()
+        if not basic:
+            ui.notify(f'标的不存在，请检查代码格式', type='negative')
+            return
+            
+        if self.db.query(Watchlist).filter(Watchlist.ts_code == ts_code).first():
+            ui.notify(f'{basic.name} 已在自选池中', type='info')
+            return
+
+        new_item = Watchlist(
+            ts_code=basic.ts_code, name=basic.name, 
+            industry=basic.industry, weight=1.0, group_name='核心观望'
+        )
+        self.db.add(new_item)
+        self.db.commit()
+        ui.notify(f'✅ 已成功添加: {basic.name}', type='positive')
+        self.update_grid()
+
+    def update_grid(self):
+        if self.grid:
+            self.grid.options['rowData'] = self._fetch_data()
+            self.grid.update()
+
+    def content(self):
+        with ui.column().classes('w-full p-8 max-w-7xl mx-auto'):
+            ui.label('🌟 自选池管理').classes('text-3xl font-light text-slate-700 mb-6')
+
+            # 🛠️ 交互修正：搜索框 + 按钮 + 美化后的删除按钮
+            with ui.row().classes('w-full items-center gap-4 mb-6 bg-white p-4 rounded-lg border border-slate-100 shadow-sm'):
+                
+                # 搜索框部分
+                search_box = ui.select(
+                    options=self.stock_options, 
+                    with_input=True, 
+                    label='输入代码 (如 600519.SH) 或名称',
+                ).classes('w-96').props('use-input fill-input hide-selected outlined dense')
+                
+                # 添加按钮
+                ui.button('添加', icon='add', on_click=lambda: self.add_stock(search_box.value)) \
+                    .props('flat color=primary').classes('px-4 border border-slate-200 rounded-md')
+
+                search_box.on('keydown.enter', lambda: self.add_stock(search_box.value))
+
+                ui.label('💡 提示：双击表格修改分组/权重').classes('text-xs text-slate-400 ml-2')
+                
+                # --- 美化后的删除按钮 ---
+                # 初始状态为 flat 红色，带删除图标
+                self.delete_btn = ui.button('移除选中', icon='delete_outline', on_click=self.confirm_delete) \
+                    .props('flat color=red').classes('ml-auto px-4 hover:bg-red-50 rounded-md transition-all text-sm font-medium')
+
+            # AG Grid
+            self.grid = ui.aggrid({
+                'columnDefs': [
+                    {'headerName': '代码', 'field': 'ts_code', 'checkboxSelection': True, 'headerCheckboxSelection': True},
+                    {'headerName': '名称', 'field': 'name'},
+                    {'headerName': '分组', 'field': 'group_name', 'editable': True, 'cellClass': 'bg-blue-50'},
+                    {'headerName': '权重', 'field': 'weight', 'editable': True, 'cellClass': 'bg-green-50', 'sort': 'desc'},
+                    {'headerName': '所属行业', 'field': 'industry'},
+                ],
+                'rowData': self._fetch_data(),
+                'rowSelection': 'multiple',
+                'theme': 'balham',
+                'stopEditingWhenCellsLoseFocus': True
+            }).classes('w-full h-[600px] bg-white rounded-lg shadow-sm').on('cellValueChanged', self.update_cell)
+
+    async def confirm_delete(self):
+        """弹出二次确认对话框"""
+        selected = await self.grid.get_selected_rows()
+        if not selected:
+            ui.notify('请先在左侧勾选要移除的股票', type='warning')
+            return
+
+        with ui.dialog() as dialog, ui.card().classes('p-6'):
+            ui.label(f'⚠️ 确定要从自选池移除这 {len(selected)} 只股票吗？').classes('text-lg font-medium')
+            ui.label('此操作将删除您配置的分组与权重信息。').classes('text-sm text-slate-500 mb-4')
+            with ui.row().classes('w-full justify-end gap-2'):
+                ui.button('取消', on_click=dialog.close).props('flat')
+                ui.button('确定移除', color='red', on_click=lambda: self.execute_delete(selected, dialog)).props('unelevated')
+        dialog.open()
+
+    async def execute_delete(self, selected, dialog):
+        """执行实际物理删除"""
+        for row in selected:
+            self.db.query(Watchlist).filter(Watchlist.ts_code == row['ts_code']).delete()
+        self.db.commit()
+        dialog.close()
+        ui.notify(f'🗑️ 已成功移除所选标的', type='info')
+        self.update_grid()
+
+    def __del__(self):
+        self.db.close()
+
+------------------------------------------------------------
+FILE PATH: database/models.py
+------------------------------------------------------------
+from sqlalchemy import Column, String, Float, Boolean, DateTime, Integer, Text, PrimaryKeyConstraint, func
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
+from sqlalchemy import create_engine
+from datetime import datetime
+from core.config import settings
+
+# 1. 数据库连接引擎
+engine = create_engine(settings.DB_URL)
+
+# 2. 会话工厂 (这就是报错缺失的部分)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+class Base(DeclarativeBase):
+    pass
+
+# --- Meta Data Layer (基础信息) ---
+
+class StockBasic(Base):
+    """
+    股票基础信息表 (PRD 4.1)
+    """
+    __tablename__ = "stock_basic"
+
+    ts_code = Column(String(20), primary_key=True, comment="TS代码")
+    symbol = Column(String(20), comment="股票代码")
+    name = Column(String(50), comment="股票名称")
+    area = Column(String(50), comment="地域")
+    industry = Column(String(50), comment="所属行业")
+    market = Column(String(50), comment="市场类型")
+    list_date = Column(String(8), comment="上市日期")
+    
+    # 核心字段: 标记是否为中证800 (PRD 1.2)
+    is_csi800 = Column(Boolean, default=False, index=True, comment="是否中证800")
+
+class Watchlist(Base):
+    """
+    用户自选股池 (PRD 1.2)
+    """
+    __tablename__ = "watchlist"
+
+    ts_code = Column(String(20), primary_key=True)
+    name = Column(String(50))
+    industry = Column(String(50))
+    group_name = Column(String(50), default='核心观望', comment="自选分组")
+    weight = Column(Float, default=1.0, comment="权重")
+    add_time = Column(DateTime, default=datetime.now)
+
+# --- ODS Layer (原始数据层 - Store Everything) ---
+
+class ODSMarketDaily(Base):
+    """
+    日线行情 (PRD 2.1)
+    """
+    __tablename__ = "ods_market_daily"
+
+    ts_code = Column(String(20), primary_key=True)
+    trade_date = Column(String(8), primary_key=True, index=True)
+    open = Column(Float)
+    high = Column(Float)
+    low = Column(Float)
+    close = Column(Float)
+    pre_close = Column(Float)
+    change = Column(Float)
+    pct_chg = Column(Float)
+    vol = Column(Float, comment="成交量(手)")
+    amount = Column(Float, comment="成交额(千元)")
+
+class ODSAdjFactor(Base):
+    """
+    复权因子 (PRD 2.1)
+    """
+    __tablename__ = "ods_adj_factor"
+
+    ts_code = Column(String(20), primary_key=True)
+    trade_date = Column(String(8), primary_key=True)
+    adj_factor = Column(Float)
+
+class ODSDailyBasic(Base):
+    """ODS: 每日指标原始表 (PE/PB/换手率/总市值)"""
+    __tablename__ = 'ods_daily_basic'
+
+    ts_code = Column(String(20), primary_key=True)
+    trade_date = Column(String(8), primary_key=True)
+    pe_ttm = Column(Float)
+    pb = Column(Float)
+    turnover_rate = Column(Float)
+    total_mv = Column(Float) # 总市值
+    update_flag = Column(DateTime, default=func.now())
+
+class ODSFinanceReport(Base):
+    """
+    通用财务报表存储 (PRD 4.2)
+    策略: JSONB 宽表模式
+    """
+    __tablename__ = "ods_finance_report"
+
+    # 复合主键：必须包含 category 以区分 income/balancesheet/cashflow 接口数据 [cite: 8, 93-95]
+    ts_code = Column(String(20), primary_key=True)
+    end_date = Column(String(8), primary_key=True, comment="报告期")
+    report_type = Column(String(10), primary_key=True, comment="报表类型")
+    update_flag = Column(String(5), primary_key=True, default='0', comment="更新标记")
+    category = Column(String(20), primary_key=True, index=True, comment="报表类别") # 升级为主键
+    
+    ann_date = Column(String(8), comment="公告日期")
+    
+    # 核心字段
+    data = Column(JSONB, comment="原始财务数据JSON")
+
+# --- DWS Layer (标准服务层 - Strict Logic) ---
+
+class DWSMarketIndicators(Base):
+    """
+    市场衍生指标表 (PRD 2.2)
+    包含: 复权后均线, PE/PB/市值
+    """
+    __tablename__ = "dws_market_indicators"
+
+    ts_code = Column(String(20), primary_key=True)
+    trade_date = Column(String(8), primary_key=True, index=True)
+    
+    # 基础指标 (来自 daily_basic)
+    pe_ttm = Column(Float, comment="PE(TTM)")
+    pb = Column(Float, comment="市净率")
+    total_mv = Column(Float, comment="总市值")
+    turnover_rate = Column(Float, comment="换手率")
+    
+    # 计算指标 (基于 QFQ)
+    close_qfq = Column(Float, comment="前复权收盘价")
+    ma_20 = Column(Float, comment="20日均线")
+    ma_50 = Column(Float, comment="50日均线")
+    ma_120 = Column(Float, comment="120日均线")
+    ma_250 = Column(Float, comment="250日均线 (年线)")
+    # PRD 3.1 容错: 行数<850时，ma_850为NULL
+    ma_850 = Column(Float, comment="850日均线 (三年线)")
+
+class DWSFinanceStd(Base):
+    """
+    标准化财务宽表 (PRD 2.2)
+    逻辑: 仅存储 report_type='1' (合并报表) 的清洗后数据
+    """
+    __tablename__ = "dws_finance_std"
+
+    ts_code = Column(String(20), primary_key=True)
+    end_date = Column(String(8), primary_key=True, index=True, comment="报告期")
+    ann_date = Column(String(8), comment="公告日期")
+    
+    # 核心字段 (映射自 Mapping)
+    revenue = Column(Float, comment="营业收入")
+    n_income_attr_p = Column(Float, comment="归母净利润")
+    n_cashflow_act = Column(Float, comment="经营现金流")
+    debt_to_assets = Column(Float, comment="资产负债率")
+    roe = Column(Float, comment="ROE")
+    grossprofit_margin = Column(Float, comment="毛利率")
+    
+    # --- V7.4 新增：审计与防伪物理字段 [关键修复] ---
+    # A. 利润成色
+    ocf_to_net_profit = Column(Float, comment="净现比(经营现金流/归母净利)")
+    
+    # B. 资产水分
+    toxic_asset_ratio = Column(Float, comment="垃圾资产占比(其他应收+预付+待摊)/总资产")
+    
+    # C. 增长匹配
+    ar_rev_gap = Column(Float, comment="应收营收增速差")
+    
+    # D. 泡沫指标
+    goodwill_net_asset_ratio = Column(Float, comment="商誉/归母净资产")
+
+    # --- 辅助计算用的原始科目 ---
+    oth_receiv = Column(Float, comment="其他应收款")
+    prepayment = Column(Float, comment="预付款项")
+    goodwill = Column(Float, comment="商誉")
+    total_assets = Column(Float, comment="资产总计")
+    total_hldr_eqy_exc_min_int = Column(Float, comment="归母净资产")
+
+# --- 工具函数 ---
+def init_db():
+    """初始化数据库表结构"""
+    Base.metadata.create_all(bind=engine)
+
+------------------------------------------------------------
+FILE PATH: interface/tushare_client.py
+------------------------------------------------------------
+import tushare as ts
+import pandas as pd
+import time
+from core.config import settings
+from functools import wraps
+
+class TushareClient:
+    def __init__(self):
+        if not settings.TS_TOKEN:
+            raise ValueError("Tushare Token is missing in settings")
+        
+        # 初始化 Pro 接口 (PRD 1.1)
+        self.pro = ts.pro_api(settings.TS_TOKEN)
+        print(f"📡 Tushare Client Initialized. Token: {settings.TS_TOKEN[:5]}***")
+
+    def retry_policy(func):
+        """
+        装饰器: Tushare 官方建议的重试机制
+        Ref: Tushare PDF [cite: 18]
+        """
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            max_retries = 3
+            for i in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    print(f"⚠️ API Warning: {e}, Retrying ({i+1}/{max_retries})...")
+                    time.sleep(1)
+            raise Exception(f"❌ API Failed after {max_retries} retries.")
+        return wrapper
+
+    # --- 1. 基础数据 ---
+    
+    @retry_policy
+    def fetch_stock_basic(self):
+        """获取全市场股票列表 (PRD 2.1)"""
+        fields = 'ts_code,symbol,name,area,industry,market,list_date'
+        return self.pro.stock_basic(exchange='', list_status='L', fields=fields)
+
+    # --- 2. 市场行情 (Column Storage) ---
+
+    @retry_policy
+    def fetch_daily(self, ts_code=None, trade_date=None, start_date=None, end_date=None):
+        """
+        日线行情
+        Ref: Tushare PDF Daily Interface [cite: 252]
+        """
+        return self.pro.daily(ts_code=ts_code, trade_date=trade_date, 
+                              start_date=start_date, end_date=end_date)
+
+    @retry_policy
+    def fetch_adj_factor(self, ts_code=None, trade_date=None, start_date=None, end_date=None):
+        """复权因子"""
+        return self.pro.adj_factor(ts_code=ts_code, trade_date=trade_date, 
+                                   start_date=start_date, end_date=end_date)
+
+    # --- 3. 财务数据 (JSONB Storage) ---
+    @retry_policy
+    def fetch_income(self, ts_code=None, ann_date=None, start_date=None, end_date=None, period=None):
+        """利润表 - 将参数设为可选，支持垂直回溯 [cite: 631-632]"""
+        return self.pro.income(ts_code=ts_code, ann_date=ann_date, 
+                               start_date=start_date, end_date=end_date, period=period)
+
+    @retry_policy
+    def fetch_balancesheet(self, ts_code=None, ann_date=None, start_date=None, end_date=None, period=None):
+        """资产负债表 [cite: 654-655]"""
+        return self.pro.balancesheet(ts_code=ts_code, ann_date=ann_date, 
+                                     start_date=start_date, end_date=end_date, period=period)
+
+    @retry_policy
+    def fetch_cashflow(self, ts_code=None, ann_date=None, start_date=None, end_date=None, period=None):
+        """现金流量表 [cite: 692-693]"""
+        return self.pro.cashflow(ts_code=ts_code, ann_date=ann_date, 
+                                 start_date=start_date, end_date=end_date, period=period)
+
+    @retry_policy
+    def fetch_fina_indicator(self, ts_code=None, ann_date=None, start_date=None, end_date=None, period=None):
+        """财务指标表 [cite: 753-754]"""
+        return self.pro.fina_indicator(ts_code=ts_code, ann_date=ann_date, 
+                                       start_date=start_date, end_date=end_date, period=period)
+
+# 单例模式
+ts_client = TushareClient()
+
+------------------------------------------------------------
+FILE PATH: tools/audit_system.py
+------------------------------------------------------------
+import sys
+import os
+import pandas as pd
+from sqlalchemy import func, text
+
+# 路径设置
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from database.models import SessionLocal, StockBasic, ODSMarketDaily, ODSFinanceReport
+from core.mapping import SOURCE_TABLE_MAP
+
+class DataAuditor:
+    def __init__(self):
+        self.db = SessionLocal()
+        print("\n⚖️ === Invest System 数据审计中心 V1.0 ===")
+
+    def audit_market_data(self):
+        """审计行情连续性"""
+        print("\n[1. 行情连续性审计]")
+        # 统计 Universe 中每只股票的记录数
+        query = self.db.query(
+            ODSMarketDaily.ts_code, 
+            func.count(ODSMarketDaily.trade_date).label('count'),
+            func.min(ODSMarketDaily.trade_date).label('start'),
+            func.max(ODSMarketDaily.trade_date).label('end')
+        ).group_by(ODSMarketDaily.ts_code).all()
+
+        if not query:
+            print("  ⚠️ ODS Market 表为空，请先运行同步。")
+            return
+
+        df = pd.DataFrame(query)
+        print(f"  - 覆盖标的总数: {len(df)}")
+        # 找出记录数显著偏少的标的 (例如少于 100 行)
+        gaps = df[df['count'] < 100]
+        if not gaps.empty:
+            print(f"  - ⚠️ 警告: 发现 {len(gaps)} 只股票记录严重不足 (少于 100 天)。")
+
+    def audit_financial_completeness(self):
+        """审计财务报表齐备性 (四大金刚)"""
+        print("\n[2. 财务报表齐备性审计 (PRD 1.3 2015+ 标准)]")
+        
+        # 修改点：增加日期过滤，确保不审计 2015 之前的无效数据
+        query = text("""
+            WITH report_stats AS (
+                SELECT ts_code, end_date, COUNT(DISTINCT category) as cat_count
+                FROM ods_finance_report
+                WHERE report_type = '1' AND end_date >= '20150101'
+                GROUP BY ts_code, end_date
+            )
+            SELECT 
+                COUNT(*) as total_reports,
+                SUM(CASE WHEN cat_count = 4 THEN 1 ELSE 0 END) as perfect_reports
+            FROM report_stats
+        """)
+        
+        res = self.db.execute(query).fetchone()
+        total = res.total_reports
+        perfect = res.perfect_reports or 0
+        health_rate = (perfect / total * 100) if total > 0 else 0
+        
+        print(f"  - 审计报告期总数: {total}")
+        print(f"  - 完整报告期 (4/4): {perfect}")
+        print(f"  - 2015后财务底座健康度: {health_rate:.2f}%")
+        
+        if health_rate < 100:
+            # 展示真正的 2015 后的异常
+            error_query = text("""
+                SELECT ts_code, end_date, COUNT(DISTINCT category) as cat_count
+                FROM ods_finance_report
+                WHERE report_type = '1' AND end_date >= '20150101'
+                GROUP BY ts_code, end_date
+                HAVING COUNT(DISTINCT category) < 4
+                LIMIT 5
+            """)
+            errors = self.db.execute(error_query).fetchall()
+            if errors:
+                print(f"  ❌ 发现 {total - perfect} 组异常，样本如下:")
+                for r in errors:
+                    print(f"    - {r.ts_code} [{r.end_date}]: 仅有 {r.cat_count}/4")
+
+    def run_full_audit(self):
+        try:
+            self.audit_market_data()
+            self.audit_financial_completeness()
+        finally:
+            self.db.close()
+            print("\n" + "="*40)
+
+if __name__ == "__main__":
+    auditor = DataAuditor()
+    auditor.run_full_audit()
+
+------------------------------------------------------------
+FILE PATH: tools/db_inspector.py
+------------------------------------------------------------
+import sys
+import os
+import pandas as pd
+from sqlalchemy import text, func, distinct
+from datetime import datetime
+
+# Path setup
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from database.models import (
+    SessionLocal, StockBasic, Watchlist, 
+    ODSMarketDaily, ODSFinanceReport, 
+    DWSMarketIndicators, DWSFinanceStd
+)
+
+class DBInspectorV2:
+    def __init__(self):
+        self.db = SessionLocal()
+        print(f"\n🩺 === Invest System DB Inspector V2.0 (Funnel Edition) ===")
+        print(f"📅 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("="*60)
+
+    def close(self):
+        self.db.close()
+
+    def _get_universe_count(self):
+        """Helper to get universe set size"""
+        csi800_count = self.db.query(StockBasic).filter(StockBasic.is_csi800 == True).count()
+        watchlist_count = self.db.query(Watchlist).count()
+        # Note: Set union size logic is complex in SQL without subqueries, 
+        # listing counts separately is enough for inspection.
+        return csi800_count, watchlist_count
+
+    def check_asset_structure(self):
+        """1. 检查资产构成 (Universe Structure)"""
+        print("\n[1. Asset Universe Structure]")
+        
+        total_stocks = self.db.query(StockBasic).count()
+        csi800, watchlist = self._get_universe_count()
+        
+        print(f"  - 🏢 Total Stocks Listed: {total_stocks}")
+        print(f"  - 💎 CSI 800 Components:  {csi800}  (Target: ~800)")
+        print(f"  - 🌟 User Watchlist:      {watchlist}")
+        
+        if csi800 == 0:
+            print("  ⚠️ CRITICAL: CSI 800 not marked! Run 'updater.sync_stock_list()' ASAP.")
+        else:
+            print("  ✅ Core Assets marked.")
+
+    def check_data_density(self):
+        """2. 检查数据密度 (Data Density)"""
+        print("\n[2. Data Layer Density]")
+        
+        counts = {
+            "ODS Market (Rows)": self.db.query(ODSMarketDaily).count(),
+            "ODS Finance (Reports)": self.db.query(ODSFinanceReport).count(),
+            "DWS Market (Indicators)": self.db.query(DWSMarketIndicators).count(),
+            "DWS Finance (Std Rows)": self.db.query(DWSFinanceStd).count()
+        }
+        
+        for k, v in counts.items():
+            print(f"  - {k:<25}: {v}")
+
+    def check_funnel_health(self):
+        """3. 漏斗机制验证 (Funnel Validation)"""
+        print("\n[3. Funnel Mechanism Check]")
+        
+        # Logic: Pick a non-universe stock and ensure it has NO financial data
+        # 1. Find a stock NOT in CSI800 and NOT in Watchlist
+        # This is a bit heavy for SQL, we do a simple sampling
+        
+        subquery = self.db.query(Watchlist.ts_code)
+        sample_trash = self.db.query(StockBasic.ts_code).filter(
+            StockBasic.is_csi800 == False,
+            StockBasic.ts_code.not_in(subquery)
+        ).limit(1).scalar()
+        
+        if sample_trash:
+            # Check if this "trash" stock has data in ODS Finance
+            junk_data = self.db.query(ODSFinanceReport).filter(ODSFinanceReport.ts_code == sample_trash).count()
+            if junk_data > 0:
+                print(f"  ❌ LEAK DETECTED! Non-universe stock {sample_trash} has {junk_data} financial reports.")
+            else:
+                print(f"  ✅ Funnel Working: Non-universe stock {sample_trash} has 0 financial reports.")
+        else:
+            print("  ⚠️ Cannot verify funnel (No non-universe stocks found or DB empty).")
+
+    def check_latest_status(self):
+        """4. 最新状态 (Freshness)"""
+        print("\n[4. Data Freshness]")
+        
+        latest_daily = self.db.query(func.max(ODSMarketDaily.trade_date)).scalar()
+        latest_report = self.db.query(func.max(ODSFinanceReport.ann_date)).scalar()
+        
+        print(f"  - Latest Market Date:   {latest_daily or 'N/A'}")
+        print(f"  - Latest Report Ann:    {latest_report or 'N/A'}")
+
+    def run(self):
+        try:
+            self.check_asset_structure()
+            self.check_data_density()
+            self.check_funnel_health()
+            self.check_latest_status()
+        except Exception as e:
+            print(f"❌ Inspection Failed: {e}")
+        finally:
+            self.close()
+        print("\n" + "="*60)
+
+if __name__ == "__main__":
+    inspector = DBInspectorV2()
+    inspector.run()
+
+------------------------------------------------------------
+FILE PATH: tools/doc_generator.py
+------------------------------------------------------------
+import os
+import datetime
+
+# --- 配置区域 ---
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'note')
+
+# 1. 忽略目录
+IGNORE_DIRS = {
+    'venv', '__pycache__', '.git', '.idea', '.vscode', 
+    'data', 'temp', 'note', 'dist', 'build', 'logs'
+}
+
+# 2. 忽略文件 (.env 绝对不能上传!)
+IGNORE_FILES = {
+    '.DS_Store', 'poetry.lock', 'package-lock.json', 'LICENSE', 
+    '.env', 'requirements.txt.bak'
+}
+
+# 3. 允许读取后缀
+INCLUDE_EXTENSIONS = ('.py', '.txt', '.md', '.gitignore', '.ini', '.yaml', '.yml', '.sh', '.json')
+
+# 文件注释字典
+FILE_META = {
+    "requirements.txt": "Python依赖清单 [核心]",
+    ".gitignore": "Git忽略规则 [核心]",
+    "core/config.py": "全局配置加载器 [核心]",
+    "core/mapping.py": "中英文映射字典 [核心]",
+    "database/models.py": "SQLAlchemy数据库模型(ODS/DWS) [核心]",
+    "interface/tushare_client.py": "Tushare接口封装(带重试) [核心]",
+    "engine/updater.py": "数据更新引擎 [核心]",
+    "tools/doc_generator.py": "上下文生成工具 [工具]",
+    "tools/git_auto.py": "Git自动助理 [工具]",
+    "tools/db_inspector.py": "数据库体检工具 [工具]",
+}
+
+def get_daily_filename():
+    """
+    生成每日唯一的上下文文件名
+    格式: context_mm-dd.txt
+    策略: 每日仅生成一份，多次运行直接覆盖，避免文件爆炸
+    """
+    today = datetime.datetime.now().strftime("%m-%d")
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
+    return f"context_{today}.txt"
+
+def get_tree_str():
+    """生成目录树字符串"""
+    lines = []
+    lines.append(f"📦 PROJECT STRUCTURE (Ignored: .env, temp/, note/, data/)")
+    lines.append(f"{'='*50}")
+    
+    for root, dirs, files in os.walk(PROJECT_ROOT):
+        # 过滤目录
+        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+        
+        level = root.replace(PROJECT_ROOT, '').count(os.sep)
+        indent = ' ' * 4 * level
+        folder_name = os.path.basename(root)
+        if folder_name == os.path.basename(PROJECT_ROOT):
+            folder_name = "ROOT"
+            
+        lines.append(f"{indent}📂 {folder_name}/")
+        
+        for f in sorted(files):
+            if f in IGNORE_FILES:
+                continue
+            
+            # 简单的后缀过滤
+            if not any(f.endswith(ext) for ext in INCLUDE_EXTENSIONS) and f not in FILE_META:
+                continue
+
+            rel_path = os.path.relpath(os.path.join(root, f), PROJECT_ROOT)
+            meta = FILE_META.get(rel_path, "")
+            desc = f"  # {meta}" if meta else ""
+            
+            lines.append(f"{indent}    📄 {f}{desc}")
+            
+    lines.append(f"{'='*50}\n\n")
+    return "\n".join(lines)
+
+def generate_context_dump():
+    """生成单一整合文件"""
+    filename = get_daily_filename()
+    filepath = os.path.join(OUTPUT_DIR, filename)
+    
+    tree_str = get_tree_str()
+    
+    with open(filepath, 'w', encoding='utf-8') as outfile:
+        # Header
+        outfile.write(f"# INVEST SYSTEM CONTEXT DUMP\n")
+        outfile.write(f"# Timestamp: {datetime.datetime.now()}\n")
+        outfile.write(f"# Security: Sensitive files (.env) and temp dirs are EXCLUDED.\n\n")
+        
+        # Part 1: Tree
+        outfile.write(tree_str)
+        
+        # Part 2: Content
+        outfile.write(f"💻 CODE CONTENT\n")
+        outfile.write(f"{'='*50}\n")
+        
+        file_count = 0
+        for root, dirs, files in os.walk(PROJECT_ROOT):
+            dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+            
+            for f in sorted(files):
+                if f in IGNORE_FILES or not f.endswith(INCLUDE_EXTENSIONS):
+                    continue
+                
+                abs_path = os.path.join(root, f)
+                rel_path = os.path.relpath(abs_path, PROJECT_ROOT)
+                
+                outfile.write(f"\n{'-'*60}\n")
+                outfile.write(f"FILE PATH: {rel_path}\n")
+                outfile.write(f"{'-'*60}\n")
+                
+                try:
+                    with open(abs_path, 'r', encoding='utf-8') as infile:
+                        content = infile.read()
+                        outfile.write(content)
+                        outfile.write("\n")
+                        file_count += 1
+                except Exception as e:
+                    outfile.write(f"[Error reading file: {e}]\n")
+
+    print(f"✅ 上下文快照已更新: note/{filename}")
+    print(f"🛡️ 已屏蔽 .env 及临时目录 | 包含 {file_count} 个核心文件")
+
+if __name__ == "__main__":
+    generate_context_dump()
+
+------------------------------------------------------------
+FILE PATH: tools/git_auto.py
+------------------------------------------------------------
+import os
+import sys
+import subprocess
+from datetime import datetime
+
+# --- 配置 ---
+BRANCH = "main"
+DOC_GEN_SCRIPT = "tools/doc_generator.py"
+
+def run_cmd(cmd, desc, ignore_error=False):
+    """执行系统命令"""
+    try:
+        # capture_output=False 让命令输出直接显示在屏幕上
+        result = subprocess.run(cmd, shell=True, check=True, text=True, capture_output=False)
+        return True
+    except subprocess.CalledProcessError as e:
+        if not ignore_error:
+            print(f"❌ 执行失败 [{desc}]: {e}")
+        return False
+
+def get_cmd_output(cmd):
+    """获取命令返回的文本 (静默执行)"""
+    try:
+        result = subprocess.run(cmd, shell=True, check=True, text=True, capture_output=True)
+        return result.stdout.strip()
+    except subprocess.CalledProcessError:
+        return ""
+
+def auto_save():
+    """功能 1: 保存进度"""
+    print("\n💾 --- 正在保存进度 ---")
+    
+    # 1. 生成快照
+    if os.path.exists(DOC_GEN_SCRIPT):
+        print("1️⃣ 更新 AI 上下文快照...")
+        run_cmd(f"python3 {DOC_GEN_SCRIPT}", "生成文档", ignore_error=True)
+    
+    # 2. Add
+    run_cmd("git add .", "添加文件(git add)")
+    
+    # 3. Commit 前的检查
+    status_short = get_cmd_output("git status --short")
+    if not status_short:
+        print("⚠️ 当前没有文件变动，无需提交。")
+        # 即使没有变动，如果云端滞后，用户可能只想 push，所以不直接 return
+        # 但通常 save 是为了存新东西。这里我们继续走，方便单纯的 push 操作。
+    else:
+        print("\n📝 检测到以下文件变动：")
+        print("-" * 30)
+        print(status_short)
+        print("-" * 30)
+
+        # 4. 获取备注
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M')
+        default_msg = f"自动存档: {timestamp}"
+        
+        print(f"💡 提示：输入具体修改内容可方便日后回溯")
+        user_msg = input(f"✍️ 提交备注 (直接回车 = '{default_msg}'): ").strip()
+        commit_msg = user_msg if user_msg else default_msg
+        
+        # 5. 执行提交
+        run_cmd(f'git commit -m "{commit_msg}"', "提交代码(git commit)")
+    
+    # 6. Push
+    print("☁️ 同步到 GitHub...")
+    if run_cmd(f"git push origin {BRANCH}", "推送到云端(git push)", ignore_error=True):
+        print(f"✅ 保存成功！")
+    else:
+        print("⚠️ 普通推送失败！这通常是因为你回滚过版本。")
+        print("💡 建议：请尝试使用主菜单的 [4] 强制同步。")
+
+def show_history():
+    """功能 2: 查看历史"""
+    print("\n📜 --- 最近 10 次存档记录 ---")
+    cmd = 'git log -n 10 --pretty=format:"%C(yellow)%h%Creset | %C(cyan)%cd%Creset | %s" --date=format:"%m-%d %H:%M"'
+    os.system(cmd) 
+    print("\n")
+
+def time_travel():
+    """功能 3: 时光倒流"""
+    print("\n⏳ --- 时光倒流 (危险区) ---")
+    print("此功能可以将项目重置到过去的状态。")
+    
+    confirm = input("确定要回滚吗？(输入 y 确认): ").lower()
+    if confirm != 'y':
+        return
+
+    timestamp_str = datetime.now().strftime('%m%d_%H%M%S')
+    broken_branch = f"backup/mess_{timestamp_str}"
+    
+    print(f"\n🛡️ 正在创建救援备份分支: {broken_branch} ...")
+    run_cmd("git add .", "备份当前状态")
+    
+    backup_msg = f"[系统] 重置前自动备份 (时间: {datetime.now().strftime('%H:%M:%S')})"
+    run_cmd(f'git commit -m "{backup_msg}"', "提交备份", ignore_error=True)
+    
+    run_cmd(f"git branch {broken_branch}", "创建备份分支")
+    print(f"✅ 当前状态已安全保存在分支 [{broken_branch}]。")
+
+    show_history()
+    target_hash = input("\n🎯 请输入你要回到的那个 [Hash码] (例如 a1b2c3d): ").strip()
+    
+    if not target_hash:
+        print("❌ 未输入 Hash，操作取消。")
+        return
+
+    print(f"\n🚀 正在穿越回 {target_hash} ...")
+    if run_cmd(f"git reset --hard {target_hash}", "硬重置(Hard Reset)"):
+        print(f"\n✅ 穿越成功！")
+        print("⚠️ 注意：你需要使用主菜单的 [4] 强制同步 才能把这个变更推送到云端。")
+
+def force_sync():
+    """功能 4: 强制同步 (新增)"""
+    print("\n☢️ --- 暴力同步 (强制覆盖云端) ---")
+    print("⚠️ 警告：这会强制将 GitHub 上的代码替换为你现在本地的样子。")
+    print("⚠️ 适用场景：当你执行过 [时光倒流] 后，普通保存报错时。")
+    
+    confirm = input("❓ 确定要执行吗？(输入 yes 确认): ").strip()
+    if confirm != "yes":
+        print("已取消。")
+        return
+
+    print(f"🚀 正在强制推送 (Force Push) 到 {BRANCH} 分支...")
+    if run_cmd(f"git push -f origin {BRANCH}", "强制推送"):
+        print("\n✅ 云端已强制同步！现在 GitHub 和你本地完全一致了。")
+
+def main_menu():
+    while True:
+        print("\n🤖 === Git 智能助理 (Invest System) ===")
+        print("1. 💾 保存进度 (Save)  -> 日常使用")
+        print("2. 📜 查看历史 (Log)   -> 看看干了啥")
+        print("3. 🔙 时光倒流 (Reset) -> 救命用的")
+        print("4. ☢️ 强制同步 (Force) -> 专治报错")
+        print("0. 🚪 退出 (Exit)")
+        
+        choice = input("👉 请选择: ").strip()
+        
+        if choice == '1':
+            auto_save()
+        elif choice == '2':
+            show_history()
+        elif choice == '3':
+            time_travel()
+        elif choice == '4':
+            force_sync()
+        elif choice == '0':
+            print("Bye! 👋")
+            break
+        else:
+            print("无效选项")
+
+if __name__ == "__main__":
+    if not os.path.exists(".gitignore"):
+        print("⚠️ 错误：请在项目根目录下运行此脚本！")
+    else:
+        main_menu()
+
+------------------------------------------------------------
+FILE PATH: tools/manage_watchlist.py
+------------------------------------------------------------
+import sys
+import os
+import argparse
+from datetime import datetime
+
+# Path setup
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from database.models import SessionLocal, StockBasic, Watchlist
+from sqlalchemy.exc import IntegrityError
+
+class WatchlistManager:
+    def __init__(self):
+        self.db = SessionLocal()
+
+    def list_all(self):
+        """列出当前自选股"""
+        stocks = self.db.query(Watchlist).all()
+        print(f"\n🌟 当前自选股 ({len(stocks)}):")
+        print(f"{'TS Code':<12} {'Name':<10} {'Industry':<10} {'Added Time'}")
+        print("-" * 50)
+        for s in stocks:
+            print(f"{s.ts_code:<12} {s.name:<10} {s.industry:<10} {s.add_time.strftime('%Y-%m-%d')}")
+        print("-" * 50)
+
+    def add_stock(self, ts_code_input: str):
+        """添加股票 (带校验)"""
+        ts_code = ts_code_input.upper()
+        
+        # 1. 校验是否存在于基础列表
+        basic = self.db.query(StockBasic).filter(StockBasic.ts_code == ts_code).first()
+        if not basic:
+            print(f"❌ 错误: 代码 {ts_code} 不存在于 StockBasic 表中。请先运行 updater 更新列表。")
+            return
+
+        # 2. 添加到 Watchlist
+        try:
+            new_watch = Watchlist(
+                ts_code=basic.ts_code,
+                name=basic.name,
+                industry=basic.industry,
+                weight=1.0, # 默认权重
+                add_time=datetime.now()
+            )
+            self.db.add(new_watch)
+            self.db.commit()
+            print(f"✅ 成功添加: {basic.name} ({ts_code})")
+        except IntegrityError:
+            self.db.rollback()
+            print(f"⚠️ 警告: {ts_code} 已经在自选股中了。")
+
+    def remove_stock(self, ts_code_input: str):
+        """移除股票"""
+        ts_code = ts_code_input.upper()
+        res = self.db.query(Watchlist).filter(Watchlist.ts_code == ts_code).delete()
+        self.db.commit()
+        if res:
+            print(f"🗑️ 已移除: {ts_code}")
+        else:
+            print(f"⚠️ 未找到: {ts_code}")
+
+    def close(self):
+        self.db.close()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Invest System Watchlist Manager")
+    parser.add_argument("-l", "--list", action="store_true", help="List all watchlist stocks")
+    parser.add_argument("-a", "--add", type=str, help="Add a stock by TS_CODE (e.g., 600519.SH)")
+    parser.add_argument("-r", "--remove", type=str, help="Remove a stock by TS_CODE")
+    
+    args = parser.parse_args()
+    
+    wm = WatchlistManager()
+    
+    if args.add:
+        wm.add_stock(args.add)
+    elif args.remove:
+        wm.remove_stock(args.remove)
+    elif args.list:
+        wm.list_all()
+    else:
+        parser.print_help()
+    
+    wm.close()
+
+------------------------------------------------------------
+FILE PATH: tools/report_exporter.py
+------------------------------------------------------------
+import pandas as pd
+import os
+import sys
+from sqlalchemy import text
+
+# 路径设置：确保可以导入 database 和 core 模块
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from database.models import SessionLocal, StockBasic, DWSMarketIndicators, DWSFinanceStd
+from core.mapping import FIELD_MAPPING
+
+class ReportFactory:
+    def __init__(self, ts_code: str):
+        self.ts_code = ts_code
+        self.db = SessionLocal()
+        self.stock = self.db.query(StockBasic).filter(StockBasic.ts_code == ts_code).first()
+
+    def _calculate_shield_metrics(self, df_f: pd.DataFrame):
+        """
+        [🛡️盾] 维度：核心风险指标二次计算
+        """
+        if df_f.empty:
+            return df_f
+        
+        # 1. 计算净现比 (经营现金流 / 归母净利润)
+        # 处理分母为0的情况
+        df_f['ocf_to_profit'] = df_f.apply(
+            lambda x: x['n_cashflow_act'] / x['n_income_attr_p'] if x['n_income_attr_p'] and x['n_income_attr_p'] != 0 else 0, 
+            axis=1
+        )
+        
+        # 2. 计算商誉占比 (商誉 / 总资产)
+        # 注意：此处需确保 DWSFinanceStd 包含 goodwill 和 total_assets
+        if 'goodwill' in df_f.columns and 'total_assets' in df_f.columns:
+            df_f['goodwill_to_assets'] = df_f['goodwill'] / df_f['total_assets']
+            
+        return df_f
+
+    def fetch_full_dataset(self):
+        """抓取并聚合五大维度数据"""
+        # A. 提取 DWS 财务标准化数据 (含 🏰核、🚀矛、🛡️盾 基础字段) [cite: 25]
+        f_query = self.db.query(DWSFinanceStd).filter(DWSFinanceStd.ts_code == self.ts_code).statement
+        df_f = pd.read_sql(f_query, self.db.bind).sort_values('end_date', ascending=False)
+        
+        # 执行深度诊断计算
+        df_f = self._calculate_shield_metrics(df_f)
+        
+        # B. 提取 DWS 行情指标 (⚖️秤) [cite: 24]
+        m_query = self.db.query(DWSMarketIndicators).filter(DWSMarketIndicators.ts_code == self.ts_code).statement
+        df_m = pd.read_sql(m_query, self.db.bind).sort_values('trade_date', ascending=False)
+        
+        return df_f, df_m
+
+    def generate_excel(self):
+        """生成格式化 Excel 报告"""
+        if not self.stock:
+            print(f"❌ 错误：未在数据库中找到标的 {self.ts_code}")
+            return
+
+        print(f"🚀 正在为 [{self.stock.name}] 生成五维研报工厂数据...")
+        df_f, df_m = self.fetch_full_dataset()
+
+        # 创建导出目录
+        out_dir = "data/reports"
+        if not os.path.exists(out_dir):
+            os.makedirs(out_dir)
+        file_path = f"{out_dir}/Report_{self.ts_code}_{self.stock.name}.xlsx"
+
+        with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
+            # --- Sheet 1: 财务诊断 (🛡️盾、🏰核、🚀矛) ---
+            # 过滤 Mapping 中定义的字段进行导出
+            available_f = [col for col in df_f.columns if col in FIELD_MAPPING]
+            df_f_final = df_f[available_f].rename(columns=FIELD_MAPPING)
+            df_f_final.to_excel(writer, sheet_name='基本面诊断', index=False)
+            
+            # --- Sheet 2: 估值行情 (⚖️秤) ---
+            available_m = [col for col in df_m.columns if col in FIELD_MAPPING]
+            df_m_final = df_m[available_m].head(500).rename(columns=FIELD_MAPPING) # 取最近两年交易日 [cite: 24]
+            df_m_final.to_excel(writer, sheet_name='行情与估值', index=False)
+
+            # --- Sheet 3: 标的信息 (🏗️基) ---
+            df_info = pd.DataFrame([self.stock.__dict__])
+            available_i = [col for col in df_info.columns if col in FIELD_MAPPING]
+            df_info_final = df_info[available_i].rename(columns=FIELD_MAPPING)
+            df_info_final.to_excel(writer, sheet_name='公司基石', index=False)
+            
+        print(f"✅ 报告成功导出至: {file_path}")
+        return file_path
+
+    def close(self):
+        self.db.close()
+
+if __name__ == "__main__":
+    # 针对核心标的进行验证 [cite: 4, 5]
+    test_targets = ['600519.SH', '600036.SH']
+    for code in test_targets:
+        factory = ReportFactory(code)
+        try:
+            factory.generate_excel()
+        finally:
+            factory.close()
+
+------------------------------------------------------------
+FILE PATH: tools/reset_db.py
+------------------------------------------------------------
+import sys
+import os
+
+# 将项目根目录添加到路径
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from database.models import engine, Base, init_db
+
+def perform_reset():
+    print("⚠️ 正在准备重置数据库...")
+    confirm = input("确定要删除所有数据表并重建吗？(输入 'yes' 确认): ")
+    
+    if confirm.lower() == 'yes':
+        try:
+            # 1. 物理删除所有表
+            print("正在删除旧表...")
+            Base.metadata.drop_all(bind=engine)
+            
+            # 2. 调用模型中的初始化函数创建新表 
+            print("正在根据新模型创建表结构...")
+            init_db()
+            
+            print("✅ 数据库重置完成！新的主键约束已生效。")
+        except Exception as e:
+            print(f"❌ 重置失败: {e}")
+    else:
+        print("操作已取消。")
+
+if __name__ == "__main__":
+    perform_reset()
+
+------------------------------------------------------------
+FILE PATH: core/config.py
+------------------------------------------------------------
+import os
+from dotenv import load_dotenv
+
+# 加载 .env 文件
+load_dotenv()
+
+class Config:
+    # 基础鉴权
+    TS_TOKEN = os.getenv("TS_TOKEN")
+    DB_URL = os.getenv("DB_URL")
+    
+    # 系统常量 (PRD 1.3)
+    START_DATE = "20150101"
+    
+    # 完整性检查
+    if not TS_TOKEN:
+        raise ValueError("❌ 错误: 未在 .env 中找到 TS_TOKEN，请检查配置文件。")
+    if not DB_URL:
+        raise ValueError("❌ 错误: 未在 .env 中找到 DB_URL，请检查配置文件。")
+
+settings = Config()
+
+------------------------------------------------------------
+FILE PATH: core/mapping.py
+------------------------------------------------------------
+# core/mapping.py
+
+# ==============================================================================
+# INVEST SYSTEM MASTER MAPPING V7.1 - 核心映射矩阵
+# ==============================================================================
+
+# 1. 业务术语标准化映射 (用于 UI、Excel 导出及审计)
+# 严格遵循五大维度分类：🏗️基、🛡️盾、🏰核、🚀矛、⚖️秤
+FIELD_MAPPING = {
+    # --- 🏗️基 (Base: 基础信息) ---
+    "ts_code": "TS代码",
+    "symbol": "股票代码",
+    "name": "股票名称",
+    "industry": "所属行业",
+    "area": "地域",
+    "list_date": "上市日期",
+    "is_csi800": "中证800",
+
+    # --- 🛡️盾 (Shield: 风险排雷) ---
+    "debt_to_assets": "资产负债率(%)",
+    "current_ratio": "流动比率",
+    "quick_ratio": "速动比率",
+    "ocf_to_profit": "净现比(经营现金流/净利润)",  # 核心排雷：防止利润造假
+    "goodwill": "商誉",
+    "goodwill_to_assets": "商誉占总资产比(%)",      # 排除鸵鸟资产风险
+    "intan_assets": "无形资产",
+    "money_cap": "货币资金",
+    "st_borr": "短期借款",
+
+    # --- 🏰核 (Core: 商业壁垒与盈利) ---
+    "roe": "ROE(净资产收益率)",
+    "roe_dt": "ROE(扣非)",
+    "grossprofit_margin": "毛利率(%)",
+    "netprofit_margin": "净利率(%)",
+    "roic": "ROIC(投入资本回报率)",
+    "asset_turn": "总资产周转率",
+    "n_income_attr_p": "归母净利润",
+    "ocf_to_net_profit": "净现比(现金流/净利)",
+    "toxic_asset_ratio": "垃圾资产占比(%)",
+    "goodwill_net_asset_ratio": "商誉占比(%)",
+    "ar_rev_gap": "应收营收增速差(%)",
+    "selection_reason": "入选理由/风险提示",
+
+    # --- 🚀矛 (Spear: 成长驱动) ---
+    "tr_yoy": "营收同比增长(%)",
+    "netprofit_yoy": "净利同比增长(%)",
+    "dt_netprofit_yoy": "扣非净利同比增长(%)",
+    "contract_liab": "合同负债(蓄水池)",
+    "total_revenue": "营业总收入",
+    "revenue": "营业收入",
+
+    # --- ⚖️秤 (Scale: 估值与行情) ---
+    "trade_date": "交易日期",
+    "close_qfq": "前复权收盘价",
+    "pe_ttm": "市盈率(TTM)",
+    "pb": "市净率",
+    "total_mv": "总市值(万)",
+    "turnover_rate": "换手率(%)",
+    "ma_20": "20日均线",
+    "ma_250": "250日均线(年线)",
+    "pct_chg": "涨跌幅(%)",
+    "vol": "成交量(手)",
+    "amount": "成交额(千元)",
+}
+
+# 2. 行业感知提取规则 (解决跨表字段对齐的关键逻辑) 
+# 逻辑：当系统计算标准化财务宽表时，根据 industry 字段动态选择 ODS 原始字段
+FINANCE_EXTRACT_PIPELINE = {
+    "General": { # 一般工商业
+        "revenue": ["revenue"],
+        "n_income": ["n_income_attr_p"],
+        "cash_flow": ["n_cashflow_act"]
+    },
+    "Bank": { # 银行
+        "revenue": ["int_income", "comm_income", "n_oth_b_income"], # 收入 = 利息收入+佣金收入+其他
+        "n_income": ["n_income_attr_p"],
+        "cash_flow": ["n_cashflow_act"]
+    },
+    "Insurance": { # 保险
+        "revenue": ["prem_earned"], # 已赚保费
+        "n_income": ["n_income_attr_p"],
+    },
+    "Securities": { # 证券
+        "revenue": ["n_sec_tb_income", "n_sec_uw_income"], # 代理买卖证券+承销
+        "n_income": ["n_income_attr_p"],
+    }
+}
+
+# 3. 接口归属映射 (审计系统与 ReportFactory 使用：确定字段来源) [cite: 983]
+SOURCE_TABLE_MAP = {
+    "income": ["revenue", "int_income", "n_income_attr_p", "prem_earned", "total_revenue"],
+    "balancesheet": ["total_assets", "total_liab", "money_cap", "goodwill", "intan_assets", "contract_liab", "st_borr"],
+    "cashflow": ["n_cashflow_act", "n_cashflow_fnc_act"],
+    "fina_indicator": ["roe", "debt_to_assets", "grossprofit_margin", "netprofit_margin", "current_ratio", "quick_ratio", "roic"]
+}
+
+# 4. 报表类型映射 (用于数据清洗过滤) [cite: 1566, 1604, 1627]
+REPORT_TYPE_MAP = {
+    "1": "合并报表",
+    "6": "母公司报表",
+    "11": "调整前合并报表"
+}
+
+------------------------------------------------------------
+FILE PATH: engine/radar.py
+------------------------------------------------------------
+# FILE PATH: engine/radar.py
+import pandas as pd
+from sqlalchemy import text, func
+from database.models import SessionLocal, StockBasic, DWSMarketIndicators, DWSFinanceStd
+
+class RadarEngine:
+    def __init__(self):
+        self.db = SessionLocal()
+
+    def query(self, 
+              min_roe=8.0,           # 核心：ROE 扣非
+              max_pe=30.0,           # 估值：PE(TTM)
+              max_pb=3.0,            # 估值：PB
+              min_mv=100.0,          # 规模：总市值(亿)
+              max_debt=60.0,         # 风险：负债率
+              trend_up=True,         # 趋势：收盘 > MA20
+              pool='CSI800'          # 范围：CSI800 / Watchlist / All
+              ):
+        """
+        [PRD 3.2] 选股雷达核心筛选逻辑
+        """
+        # 1. 获取数据库最新行情日期 (T-1 后视镜)
+        latest_date = self.db.query(func.max(DWSMarketIndicators.trade_date)).scalar()
+        if not latest_date:
+            return pd.DataFrame()
+
+        # 2. 构建三表关联查询 (SQL 模式以提升性能)
+        # 关联: Basic(B) -> Indicators(I) -> Finance(F)
+        # 注意: Finance 取最近一个报告期 (end_date)
+        # --- 架构级修复：联接 ODS 获取原始涨跌幅 ---
+        sql = text("""
+            SELECT 
+                b.ts_code, b.name, b.industry,
+                i.trade_date, i.close_qfq, i.pe_ttm, i.pb, i.total_mv, i.ma_20,
+                m.pct_chg,
+                f.end_date as last_report, 
+                COALESCE(f.roe, 0) as roe, -- 这里暂时取 f.roe，我们将修改 process_finance_dws 来填充它
+                f.debt_to_assets,
+                -- V7.4 侦探指标计算 
+                COALESCE(f.n_cashflow_act / NULLIF(f.n_income_attr_p, 0), 0) as ocf_to_net_profit,
+                -- 垃圾资产比: (其他应收+预付) / 总资产
+                COALESCE((f.oth_receiv + f.prepayment) / NULLIF(f.total_assets, 0), 0) as toxic_asset_ratio,
+                -- 商誉占比: 商誉 / 归母净资产
+                COALESCE(f.goodwill / NULLIF(f.total_hldr_eqy_exc_min_int, 0), 0) as goodwill_net_asset_ratio
+            FROM stock_basic b
+            JOIN dws_market_indicators i ON b.ts_code = i.ts_code
+            JOIN ods_market_daily m ON i.ts_code = m.ts_code AND i.trade_date = m.trade_date
+            LEFT JOIN (
+                SELECT DISTINCT ON (ts_code) *
+                FROM dws_finance_std
+                ORDER BY ts_code, end_date DESC
+            ) f ON b.ts_code = f.ts_code
+            WHERE i.trade_date = :t_date
+            AND (:pool = 'All' OR 
+                (:pool = 'CSI800' AND b.is_csi800 = True) OR
+                (:pool = 'Watchlist' AND b.ts_code IN (SELECT ts_code FROM watchlist))
+            )
+        """)
+
+        df = pd.read_sql(sql, self.db.bind, params={"t_date": latest_date, "pool": pool})
+        if df.empty: return df
+
+        # --- 架构级修复：处理空值防止误杀 ---
+        # 将 ROE 缺失填充为 0，负债率缺失填充为 0 (代表风险未知但不拦截)
+        df['roe'] = df['roe'].fillna(0)
+        df['debt_to_assets'] = df['debt_to_assets'].fillna(0)
+        df['pe_ttm'] = df['pe_ttm'].fillna(999) # PE 缺失则设为极大值拦截
+        df['ocf_to_net_profit'] = df['ocf_to_net_profit'].fillna(0)
+        df['toxic_asset_ratio'] = df['toxic_asset_ratio'].fillna(0)
+        df['goodwill_net_asset_ratio'] = df['goodwill_net_asset_ratio'].fillna(0)
+
+        # 3. 执行多因子过滤
+        mask = (
+            (df['pe_ttm'] > 0) & (df['pe_ttm'] < max_pe) &
+            (df['pb'] < max_pb) &
+            (df['total_mv'] >= min_mv * 10000) & # 亿元转万元
+            (df['roe'] >= min_roe) &
+            (df['debt_to_assets'] <= max_debt) &
+            (df['ocf_to_net_profit'] >= 0.8) & 
+            (df['toxic_asset_ratio'] < 0.05) & 
+            (df['goodwill_net_asset_ratio'] < 0.25)
+        )
+        
+        if trend_up:
+            mask = mask & (df['close_qfq'] > df['ma_20'])
+
+        result = df[mask].copy()
+
+        # --- V7.4 动态理由生成 ---
+        def generate_reason(row):
+            reasons = []
+            # 亮点挖掘
+            if row['roe'] >= 20: reasons.append("高ROE(>20%)")
+            if row['ocf_to_net_profit'] >= 1.2: reasons.append("现金含量极高")
+            
+            # 风险提示
+            if row['goodwill_net_asset_ratio'] > 0.2: reasons.append("⚠商誉偏高")
+            if row['toxic_asset_ratio'] > 0.04: reasons.append("⚠资产成色一般")
+            
+            return " | ".join(reasons) if reasons else "多因子均衡"
+
+        result['selection_reason'] = result.apply(generate_reason, axis=1)
+        
+        # 格式化输出
+        result['total_mv_unit'] = (result['total_mv'] / 10000).round(2) # 转回亿元显示
+        
+        # 统一保留两位小数
+        numeric_cols = result.select_dtypes(include=['number']).columns
+        result[numeric_cols] = result[numeric_cols].round(2)
+
+        return result.sort_values('roe', ascending=False)
+
+    def close(self):
+        self.db.close()
+
+------------------------------------------------------------
+FILE PATH: engine/updater.py
+------------------------------------------------------------
+import pandas as pd
+import time
+from datetime import datetime, timedelta
+from sqlalchemy import text
+from interface.tushare_client import ts_client
+from database.models import (
+    SessionLocal, StockBasic, Watchlist, 
+    ODSMarketDaily, ODSAdjFactor, ODSFinanceReport, 
+    DWSMarketIndicators, DWSFinanceStd, ODSDailyBasic
+)
+from core.mapping import SOURCE_TABLE_MAP
+
+class DataUpdater:
+    def __init__(self):
+        self.db = SessionLocal()
+
+    def close(self):
+        self.db.close()
+
+    def _get_universe_pool(self) -> set:
+        """[PRD 1.2] 获取中证800+自选股的并集"""
+        csi800 = self.db.query(StockBasic.ts_code).filter(StockBasic.is_csi800 == True).all()
+        watchlist = self.db.query(Watchlist.ts_code).all()
+        pool = {row.ts_code for row in csi800} | {row.ts_code for row in watchlist}
+        return pool
+
+    def sync_stock_list(self):
+        """[PRD 3.1] 全量同步股票列表并标记中证800 (UI 适配版)"""
+        yield "🔄 正在从 Tushare 获取全市场基础列表..."
+        df_basics = ts_client.fetch_stock_basic()
+        if df_basics.empty: 
+            yield "❌ 获取失败：Tushare 返回为空。"
+            return
+
+        yield "💎 正在获取中证800最新成分股名单..."
+        try:
+            now_str = datetime.now().strftime("%Y%m%d")
+            df_csi800 = ts_client.pro.index_weight(index_code='000906.SH', start_date='20240101', end_date=now_str)
+            if not df_csi800.empty:
+                latest_date = df_csi800['trade_date'].max()
+                csi800_set = set(df_csi800[df_csi800['trade_date'] == latest_date]['con_code'].tolist())
+            else:
+                csi800_set = set()
+        except Exception as e:
+            yield f"⚠️ 指数获取异常: {e}"
+            csi800_set = set()
+
+        yield f"📥 正在写入数据库 (共 {len(df_basics)} 条记录)..."
+        for _, row in df_basics.iterrows():
+            is_in_index = row['ts_code'] in csi800_set
+            stock = StockBasic(
+                ts_code=row['ts_code'], symbol=row['symbol'], name=row['name'],
+                area=row['area'], industry=row['industry'], market=row['market'],
+                list_date=row['list_date'], is_csi800=is_in_index
+            )
+            self.db.merge(stock)
+        
+        self.db.commit()
+        yield f"✅ 股票列表同步完成！已识别中证800成分股: {len(csi800_set)} 只。"
+
+    # --- 场景 S1/S2/S5: 垂直历史回溯 (按代码同步) ---
+
+    def run_watchlist_backfill(self):
+        """
+        [PRD S1/S2] 自选股行情与财报深度修补
+        逻辑：针对 Watchlist 中的标的，从 20150101 起执行垂直同步 
+        """
+        watchlist = self.db.query(Watchlist.ts_code).all()
+        targets = [r.ts_code for r in watchlist]
+        
+        if not targets:
+            yield "⚠️ 自选池为空，请先在页面添加标的。"
+            return
+
+        total = len(targets)
+        yield f"🚀 启动自选池深度同步：共 {total} 只标的"
+
+        for i, ts_code in enumerate(targets):
+            yield f"正在处理 [{i+1}/{total}]: {ts_code}"
+            try:
+                # 1. 执行 ODS 层垂直拉取 (行情+财报)
+                self.sync_stock_history(ts_code, start_date="20150101")
+                
+                # 2. 执行 DWS 层数据炼制 (计算均线与标准化财报)
+                self.process_market_dws(ts_code)
+                self.process_finance_dws(ts_code)
+                
+                # 3. 2000 积分频次保护：每次同步后休眠 0.3s-0.5s [cite: 1635]
+                time.sleep(0.3)
+            except Exception as e:
+                yield f"❌ {ts_code} 同步失败: {str(e)}"
+                continue
+        
+        yield "✅ 自选池历史数据修复完成。"
+
+    def sync_stock_history(self, ts_code: str, start_date="20150101"):
+        """补全单只股票的所有历史数据 (ODS 层)"""
+        # A. 行情数据同步
+        df_daily = ts_client.fetch_daily(ts_code=ts_code, start_date=start_date)
+        if not df_daily.empty:
+            for _, row in df_daily.iterrows():
+                self.db.merge(ODSMarketDaily(
+                    ts_code=row['ts_code'], trade_date=row['trade_date'],
+                    open=row['open'], high=row['high'], low=row['low'], close=row['close'],
+                    pre_close=row['pre_close'], change=row['change'], pct_chg=row['pct_chg'],
+                    vol=row['vol'], amount=row['amount']
+                ))
+
+        # B. 复权因子同步 [cite: 1760]
+        df_adj = ts_client.fetch_adj_factor(ts_code=ts_code, start_date=start_date)
+        if not df_adj.empty:
+            for _, row in df_adj.iterrows():
+                self.db.merge(ODSAdjFactor(ts_code=row['ts_code'], trade_date=row['trade_date'], adj_factor=row['adj_factor']))
+
+        # C. 每日指标同步 (PE/PB/市值) [cite: 1766]
+        df_basic = ts_client.pro.daily_basic(ts_code=ts_code, start_date=start_date)
+        if not df_basic.empty:
+            for _, row in df_basic.iterrows():
+                self.db.merge(ODSDailyBasic(
+                    ts_code=row['ts_code'], trade_date=row['trade_date'],
+                    pe_ttm=row.get('pe_ttm'), pb=row.get('pb'), 
+                    turnover_rate=row.get('turnover_rate'), total_mv=row.get('total_mv')
+                ))
+
+        # D. 四大财报同步 (JSONB 存储) [cite: 1761]
+        tasks = {
+            "income": ts_client.fetch_income,
+            "balancesheet": ts_client.fetch_balancesheet,
+            "cashflow": ts_client.fetch_cashflow,
+            "fina_indicator": ts_client.fetch_fina_indicator
+        }
+        for category, api_func in tasks.items():
+            df = api_func(ts_code=ts_code, start_date=start_date)
+            if df is not None and not df.empty:
+                # --- 架构级修复：动态检测主键 --- 
+                # 理想的主键候选，但需兼容不同接口的字段差异
+                pk_candidates = ['ts_code', 'end_date', 'report_type', 'update_flag']
+                actual_pk = [col for col in pk_candidates if col in df.columns]
+                
+                # 执行安全去重：根据存在的字段保留最新一条 
+                df = df.drop_duplicates(subset=actual_pk, keep='last')
+
+                # 处理 NaN 并在字典转换时填充 None，防止 JSONB 写入报错 
+                df = df.astype(object).where(pd.notnull(df), None)
+                
+                for record in df.to_dict('records'):
+                    # 写入 ODS 时使用 .get() 兜底可选字段 [cite: 864-865]
+                    self.db.merge(ODSFinanceReport(
+                        ts_code=record['ts_code'], 
+                        end_date=record['end_date'],
+                        # 默认合并报表(1)和初始数据(0)以对齐数据库模型要求 [cite: 769, 864]
+                        report_type=str(record.get('report_type', '1')), 
+                        update_flag=str(record.get('update_flag', '0')), 
+                        category=category, 
+                        data=record, 
+                        ann_date=record.get('ann_date')
+                    ))
+                self.db.commit() # 每一类报表提交一次，缩小冲突范围 [cite: 865]
+
+    # --- 场景 S3: 水平每日行情 (按日期同步) ---
+
+    def sync_daily_market(self, trade_date: str):
+        """[PRD S3] 每日增量行情同步 (水平模式)"""
+        universe = self._get_universe_pool()
+        if not universe: return
+
+        try:
+            # 1. Fetch Full Market
+            df_daily = ts_client.fetch_daily(trade_date=trade_date)
+            df_adj = ts_client.fetch_adj_factor(trade_date=trade_date)
+            
+            if df_daily.empty: return
+
+            # 2. Funnel Filter
+            df_daily_filtered = df_daily[df_daily['ts_code'].isin(universe)]
+            
+            # 3. Save ODS
+            for _, row in df_daily_filtered.iterrows():
+                self.db.merge(ODSMarketDaily(
+                    ts_code=row['ts_code'], trade_date=row['trade_date'],
+                    open=row['open'], high=row['high'], low=row['low'], close=row['close'],
+                    pre_close=row['pre_close'], change=row['change'], pct_chg=row['pct_chg'],
+                    vol=row['vol'], amount=row['amount']
+                ))
+
+            if not df_adj.empty:
+                df_adj_filtered = df_adj[df_adj['ts_code'].isin(universe)]
+                for _, row in df_adj_filtered.iterrows():
+                    self.db.merge(ODSAdjFactor(
+                        ts_code=row['ts_code'], trade_date=row['trade_date'],
+                        adj_factor=row['adj_factor']
+                    ))
+
+            self.db.commit()
+            print(f"  ✅ Market Snapshot {trade_date}: Saved {len(df_daily_filtered)} records.")
+
+        except Exception as e:
+            self.db.rollback()
+            print(f"  ❌ Market Snapshot Failed: {e}")
+
+    # --- 场景 S4: 水平每日财报 (按公告日同步) ---
+
+    def sync_financial_daily(self, ann_date: str):
+        """
+        [PRD S4 修正版] 每日增量财报同步
+        针对 2000 积分优化：通过披露计划反查个股，避免全市场拉取报错
+        """
+        universe = self._get_universe_pool()
+        if not universe:
+            return
+
+        try:
+            # 1. 获取当日实际披露财报的名单 (actual_date)
+            # Ref: Tushare PDF 
+            df_ann = ts_client.pro.disclosure_date(actual_date=ann_date)
+            if df_ann.empty:
+                yield f"  ☕ {ann_date} 无财报披露。"
+                return
+
+            # 2. 筛选出属于我们 Universe 的标的
+            targets = df_ann[df_ann['ts_code'].isin(universe)]['ts_code'].unique().tolist()
+            
+            if not targets:
+                yield f"  ☕ {ann_date} 披露的 {len(df_ann)} 家公司均不在核心池中。"
+                return
+
+            yield f"  📢 发现 {len(targets)} 只核心标的披露财报，开始精准同步..."
+
+            # 3. 逐个同步个股财报 (复用 S1/S2 的垂直同步逻辑)
+            for i, ts_code in enumerate(targets):
+                yield f"    > [{i+1}/{len(targets)}] 同步财报: {ts_code}"
+                # 此处仅同步公告日前后的数据即可，为保险起见同步最近一年
+                # start_date 设为公告日前一年
+                sync_start = (datetime.strptime(ann_date, "%Y%m%d") - timedelta(days=365)).strftime("%Y%m%d")
+                self.sync_stock_history(ts_code, start_date=sync_start)
+                
+                # 频次保护
+                time.sleep(0.2)
+
+            self.db.commit()
+            yield f"  ✅ {ann_date} 财报增量同步完成。"
+
+        except Exception as e:
+            self.db.rollback()
+            yield f"  ❌ 财报增量同步失败: {str(e)}"
+
+    # --- DWS 计算逻辑 ---
+
+    def process_market_dws(self, ts_code: str):
+        """DWS: 计算均线、QFQ 并补全基本面指标"""
+        # 1. 联合查询 ODS 行情和每日指标 (daily_basic)
+        query = text("""
+            SELECT m.*, b.pe_ttm, b.pb, b.total_mv, b.turnover_rate, a.adj_factor
+            FROM ods_market_daily m
+            LEFT JOIN ods_daily_basic b ON m.ts_code = b.ts_code AND m.trade_date = b.trade_date
+            LEFT JOIN ods_adj_factor a ON m.ts_code = a.ts_code AND m.trade_date = a.trade_date
+            WHERE m.ts_code = :ts_code
+            ORDER BY m.trade_date
+        """)
+        
+        df = pd.read_sql(query, self.db.bind, params={"ts_code": ts_code})
+        if df.empty: return
+
+        # 2. 计算前复权
+        df['adj_factor'] = df['adj_factor'].ffill()
+        latest_factor = df['adj_factor'].iloc[-1] if not df['adj_factor'].isnull().all() else 1.0
+        df['close_qfq'] = df['close'] * (df['adj_factor'] / latest_factor)
+
+        # 3. 计算均线 [cite: 843]
+        for ma in [20, 50, 120, 250, 850]:
+            df[f'ma_{ma}'] = df['close_qfq'].rolling(window=ma, min_periods=ma).mean()
+
+        # 4. Upsert 写入 DWS
+        for _, row in df.iterrows():
+            self.db.merge(DWSMarketIndicators(
+                ts_code=row['ts_code'],
+                trade_date=row['trade_date'],
+                pe_ttm=row.get('pe_ttm'),
+                pb=row.get('pb'),
+                total_mv=row.get('total_mv'),
+                turnover_rate=row.get('turnover_rate'),
+                close_qfq=row['close_qfq'],
+                ma_20=row['ma_20'] if pd.notna(row['ma_20']) else None,
+                ma_50=row['ma_50'] if pd.notna(row['ma_50']) else None,
+                ma_120=row['ma_120'] if pd.notna(row['ma_120']) else None,
+                ma_250=row['ma_250'] if pd.notna(row['ma_250']) else None,
+                ma_850=row['ma_850'] if pd.notna(row['ma_850']) else None,
+            ))
+        self.db.commit()
+
+    def process_finance_dws(self, ts_code: str):
+        """[核心修复] 炼制时自动合并 roe 与 roe_dt，并计算审计指标"""
+        reports = self.db.query(ODSFinanceReport).filter(
+            ODSFinanceReport.ts_code == ts_code,
+            ODSFinanceReport.report_type == '1'
+        ).all()
+        
+        merged = {}
+        for r in reports:
+            end_date = r.end_date
+            if end_date not in merged:
+                merged[end_date] = {"ann_date": r.ann_date}
+            
+            data = r.data
+            # 提取基础字段
+            fields = [
+                'revenue', 'n_income_attr_p', 'n_cashflow_act', 'grossprofit_margin',
+                'oth_receiv', 'prepayment', 'goodwill', 'total_assets', 'total_hldr_eqy_exc_min_int',
+                'debt_to_assets', 'roe', 'roe_dt', 'total_liab'
+            ]
+            for k in fields:
+                if k in data and data[k] is not None:
+                    merged[end_date][k] = data[k]
+        
+        for end_date, m in merged.items():
+            # 必须有公告日期才能进行后续的 merge_asof [cite: 847]
+            if not m.get('ann_date'): continue 
+            
+            # 1. 准备计算数据 (利用 .get 容错)
+            net_profit = m.get('n_income_attr_p', 0) or 0
+            ocf = m.get('n_cashflow_act', 0) or 0
+            oth_receiv = m.get('oth_receiv', 0) or 0
+            prepay = m.get('prepayment', 0) or 0
+            assets = m.get('total_assets', 0) or 0
+            goodwill = m.get('goodwill', 0) or 0
+            equity = m.get('total_hldr_eqy_exc_min_int', 0) or 0
+            
+            # 2. 计算审计指标
+            # 净现比
+            ocf_ratio = ocf / net_profit if net_profit and net_profit != 0 else 0
+            # 垃圾资产占比
+            toxic_ratio = (oth_receiv + prepay) / assets if assets and assets != 0 else 0
+            # 商誉占比
+            gw_ratio = goodwill / equity if equity and equity != 0 else 0
+            
+            # 3. 负债率多路径提取
+            debt_ratio = m.get('debt_to_assets')
+            if debt_ratio is None:
+                liab = m.get('total_liab')
+                if liab and assets and assets != 0:
+                    debt_ratio = (liab / assets) * 100
+            
+            # 4. ROE 优先级
+            roe_final = m.get('roe_dt') if m.get('roe_dt') is not None else m.get('roe')
+
+            self.db.merge(DWSFinanceStd(
+                ts_code=ts_code, end_date=end_date, ann_date=m.get('ann_date'),
+                revenue=m.get('revenue'),
+                n_income_attr_p=m.get('n_income_attr_p'),
+                n_cashflow_act=m.get('n_cashflow_act'),
+                debt_to_assets=debt_ratio,
+                roe=roe_final,
+                grossprofit_margin=m.get('grossprofit_margin'),
+                oth_receiv=m.get('oth_receiv'),
+                prepayment=m.get('prepayment'),
+                goodwill=m.get('goodwill'),
+                total_assets=m.get('total_assets'),
+                total_hldr_eqy_exc_min_int=m.get('total_hldr_eqy_exc_min_int'),
+                # 存入物理字段
+                ocf_to_net_profit=round(ocf_ratio, 4),
+                toxic_asset_ratio=round(toxic_ratio, 4),
+                goodwill_net_asset_ratio=round(gw_ratio, 4)
+            ))
+        self.db.commit()
+
+    # --- 调度器 (支持进度返回) ---
+
+    def run_full_backfill(self, start_date="20150101"):
+        """[PRD S5] 核心池财务与行情全量初始化"""
+        yield "🚀 开始全量回溯 (Full Backfill)..."
+        yield from self.sync_stock_list()
+        
+        universe = list(self._get_universe_pool())
+        total = len(universe)
+        
+        for i, ts_code in enumerate(universe):
+            # 使用 yield 让前端 NiceGUI 可以实时更新进度条 [cite: 107-108]
+            yield f"正在补全第 {i+1}/{total} 只: {ts_code}"
+            try:
+                self.sync_stock_history(ts_code, start_date)
+                # DWS Calculation
+                self.process_market_dws(ts_code)
+                self.process_finance_dws(ts_code)
+                time.sleep(0.1) # 频次保护
+            except Exception as e:
+                yield f"⚠️ {ts_code} 同步失败: {str(e)}"
+        yield "✅ 全量回溯任务完成"
+
+    def run_daily_routine(self):
+        """
+        [PRD S3/S4 进化版] 自动区间补全日更
+        逻辑：自动计算断档期并循环补全，确保隔周/隔月更新不漏数据
+        """
+        # 1. 确定补全区间
+        # 查找本地最新行情日期作为起点
+        res = self.db.execute(text("SELECT max(trade_date) FROM ods_market_daily")).fetchone()
+        last_date_str = res[0] if res and res[0] else "20241201" # 默认回溯起点
+        
+        start_date = (datetime.strptime(last_date_str, "%Y%m%d") + timedelta(days=1))
+        end_date = datetime.now()
+        
+        # 获取期间所有交易日 (避免非交易日报错)
+        # 注意：这里调用 tushare 交易日历接口
+        cal = ts_client.pro.trade_cal(exchange='', start_date=start_date.strftime('%Y%m%d'), 
+                                     end_date=end_date.strftime('%Y%m%d'), is_open='1')
+        trade_days = cal['cal_date'].tolist()
+
+        if not trade_days:
+            yield "☕ 数据已是最新，无需更新。"
+            return
+
+        yield f"🚀 发现 {len(trade_days)} 个交易日待补全: {trade_days[0]} -> {trade_days[-1]}"
+
+        # 2. 核心同步循环
+        for date_str in trade_days:
+            yield f"📅 正在处理: {date_str} ..."
+            
+            # A. 同步全市场行情 (S3) 
+            self.sync_daily_market(date_str)
+            
+            # B. 同步每日指标 (PE/PB/市值) - 修正：需手动添加 horizontal 模式
+            yield f"  > 拉取每日指标 (PE/PB)..."
+            df_basic = ts_client.pro.daily_basic(trade_date=date_str)
+            if not df_basic.empty:
+                # 仅存 universe 内的
+                universe = self._get_universe_pool()
+                df_target = df_basic[df_basic['ts_code'].isin(universe)]
+                for _, row in df_target.iterrows():
+                    self.db.merge(ODSDailyBasic(
+                        ts_code=row['ts_code'], trade_date=row['trade_date'],
+                        pe_ttm=row.get('pe_ttm'), pb=row.get('pb'),
+                        total_mv=row.get('total_mv'), turnover_rate=row.get('turnover_rate')
+                    ))
+            
+            # C. 检查并同步当日披露的财报 (S4 修正版)
+            # 这里调用上一张指令卡修复后的 sync_financial_daily
+            # 由于 sync_financial_daily 是生成器，需要遍历它
+            for msg in self.sync_financial_daily(date_str):
+                yield f"    {msg}"
+            
+            self.db.commit()
+            time.sleep(0.5) # 2000积分频次保护 [cite: 345]
+
+        # 3. 统一触发 DWS 重炼 [cite: 140]
+        yield "🔄 正在重新炼制 DWS 衍生指标..."
+        universe = list(self._get_universe_pool())
+        for i, ts_code in enumerate(universe):
+            self.process_market_dws(ts_code)
+            self.process_finance_dws(ts_code)
+            if i % 100 == 0:
+                yield f"  > 炼制进度: {i}/{len(universe)}"
+        
+        yield "✅ 全区间数据补全并炼制完成！"
+
+if __name__ == "__main__":
+    u = DataUpdater()
+    # u.sync_stock_list()
+    u.close()

@@ -26,7 +26,11 @@ class RadarPage:
                 trend_up=self.trend_toggle.value
             )
             self.current_df = df
-            records = json.loads(df.to_json(orient='records', date_format='iso'))
+
+            # 1. 强制将所有空值(NaN)和无穷大(Inf)替换为 0
+            df = df.replace([float('inf'), float('-inf')], 0).fillna(0)
+            # 2. 然后再把这个干净的 df 传给表格
+            records = df.to_dict('records')
             
             if self.stats_label:
                 count = len(records)
@@ -116,8 +120,8 @@ class RadarPage:
             return slider
 
     def content(self):
-        # 修改 1：升级为全屏流式布局 (max-w-full)
-        with ui.column().classes('w-full p-6 max-w-full mx-auto gap-6 bg-slate-50'):
+        # 布局调整：左右各留 15% 空间 (max-w-[70vw])
+        with ui.column().classes('w-full mx-auto px-4 py-8 items-center').style('max-width: 60vw'):
             # 顶层头部
             with ui.row().classes('w-full items-center justify-between'):
                 with ui.row().classes('items-center gap-4'):
@@ -183,7 +187,7 @@ class RadarPage:
             with ui.card().props('flat').classes('w-full bg-slate-900 text-white p-6 rounded-xl'):
                 with ui.row().classes('items-center gap-4'):
                     ui.icon('security', color='primary').classes('text-3xl')
-                    ui.label('雷达审计逻辑看板 (V7.4 Forensic Edition)').classes('text-xl font-bold tracking-tight')
+                    ui.label('雷达审计逻辑').classes('text-xl font-bold tracking-tight')
                 
                 ui.separator().classes('my-4 bg-slate-700')
                 
