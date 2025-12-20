@@ -9,6 +9,7 @@ sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
 from ui.layout import theme_setup, shared_menu
 from ui.pages.console import ConsolePage
+from ui.pages.watchlist import WatchlistPage
 
 @ui.page('/')
 def index():
@@ -24,6 +25,12 @@ def radar_page():
     theme_setup()
     shared_menu()
     ui.label('选股雷达 - 正在炼制中...').classes('text-h4 m-6')
+
+@ui.page('/watchlist')
+def watchlist_page():
+    theme_setup()
+    shared_menu()
+    WatchlistPage().content()
 
 # 核心修复：修改启动守护条件
 if __name__ in {"__main__", "__mp_main__", "nicegui"}:

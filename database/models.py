@@ -42,6 +42,7 @@ class Watchlist(Base):
     ts_code = Column(String(20), primary_key=True)
     name = Column(String(50))
     industry = Column(String(50))
+    group_name = Column(String(50), default='核心观望', comment="自选分组")
     weight = Column(Float, default=1.0, comment="权重")
     add_time = Column(DateTime, default=datetime.now)
 
