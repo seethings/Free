@@ -6,16 +6,28 @@ def theme_setup():
     ui.query('body').style('font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #f8fafc;')
 
 def shared_menu():
-    """侧边栏导航组件"""
-    with ui.left_drawer(value=True).classes('bg-slate-100').props('bordered'):
-        ui.label('🏗️ INVEST SYSTEM').classes('text-xl font-bold m-4 text-blue-800')
-        ui.separator()
-        with ui.column().classes('w-full p-2 gap-2'):
-            ui.button('控制台', icon='dashboard', on_click=lambda: ui.navigate.to('/')).props('flat').classes('w-full justify-start')
-            ui.button('选股雷达', icon='radar', on_click=lambda: ui.navigate.to('/radar')).props('flat').classes('w-full justify-start')
-            ui.button('自选管理', icon='list', on_click=lambda: ui.navigate.to('/watchlist')).props('flat').classes('w-full justify-start')
-            ui.button('个股透视', icon='analytics', on_click=lambda: ui.navigate.to('/stock')).props('flat').classes('w-full justify-start')
+    """侧边栏导航组件 - 边距增强版"""
+    with ui.left_drawer(value=True).classes('bg-slate-50').props('bordered'):
+        # 标志区
+        ui.label('🏗️ INVEST SYSTEM').classes('text-lg font-bold mt-8 mb-4 ml-10 text-blue-900 tracking-tight')
+        ui.separator().classes('mx-6')
         
-        with ui.column().classes('absolute-bottom w-full p-4 text-slate-400 text-xs'):
+        # 导航菜单
+        with ui.column().classes('w-full mt-6 gap-2'):
+            # 增加 pl-10 (约 40px) 的左侧内边距，确保文字左对齐且有呼吸感
+            ui.button('数据维护', icon='settings', on_click=lambda: ui.navigate.to('/')) \
+                .props('flat no-caps').classes('w-full justify-start pl-10 text-slate-600 hover:text-blue-700 font-medium')
+            
+            ui.button('选股雷达', icon='radar', on_click=lambda: ui.navigate.to('/radar')) \
+                .props('flat no-caps').classes('w-full justify-start pl-10 text-slate-600 hover:text-blue-700 font-medium')
+            
+            ui.button('自选管理', icon='star_border', on_click=lambda: ui.navigate.to('/watchlist')) \
+                .props('flat no-caps').classes('w-full justify-start pl-10 text-slate-600 hover:text-blue-700 font-medium')
+            
+            ui.button('个股透视', icon='insights', on_click=lambda: ui.navigate.to('/stock')) \
+                .props('flat no-caps').classes('w-full justify-start pl-10 text-slate-600 hover:text-blue-700 font-medium')
+        
+        # 底部状态
+        with ui.column().classes('absolute-bottom w-full p-6 text-slate-400 text-[10px]'):
             ui.label('V7.3 Architect Edition')
-            ui.label('Tushare 2000+ pts Locked')
+            ui.label('DB FRESHNESS: 2025-12-19') # 动态日期可后续实装

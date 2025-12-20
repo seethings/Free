@@ -1,20 +1,24 @@
 # INVEST SYSTEM CONTEXT DUMP
-# Timestamp: 2025-12-20 09:54:49.434140
+# Timestamp: 2025-12-20 13:29:09.338202
 # Security: Sensitive files (.env) and temp dirs are EXCLUDED.
 
 📦 PROJECT STRUCTURE (Ignored: .env, temp/, note/, data/)
 ==================================================
 📂 ROOT/
     📄 .gitignore  # Git忽略规则 [核心]
+    📄 debug_stock.py
     📄 main.py
     📄 requirements.txt  # Python依赖清单 [核心]
     📄 run_backfill.py
+    📄 test_radar.py
+    📄 test_sync_engine.py
     📂 ui/
         📄 __init__.py
         📄 layout.py
         📂 pages/
             📄 __init__.py
             📄 console.py
+            📄 radar.py
             📄 watchlist.py
     📂 database/
         📄 models.py  # SQLAlchemy数据库模型(ODS/DWS) [核心]
@@ -32,6 +36,7 @@
         📄 config.py  # 全局配置加载器 [核心]
         📄 mapping.py  # 中英文映射字典 [核心]
     📂 engine/
+        📄 radar.py
         📄 updater.py  # 数据更新引擎 [核心]
 ==================================================
 
@@ -63,50 +68,85 @@ data/*
 !data/.gitkeep
 
 ------------------------------------------------------------
+FILE PATH: debug_stock.py
+------------------------------------------------------------
+# FILE PATH: debug_stock.py
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.dirname(__file__)))
+from database.models import SessionLocal, DWSMarketIndicators, DWSFinanceStd, StockBasic
+from sqlalchemy import func
+
+def debug_haier():
+    db = SessionLocal()
+    ts_code = '600690.SH'
+    
+    # 1. 检查基础标记
+    basic = db.query(StockBasic).filter(StockBasic.ts_code == ts_code).first()
+    print(f"🏗️ 基础检查: {ts_code} | 名称: {basic.name if basic else '未找到'}")
+
+    # 2. 检查 DWS 行情指标 (取最新一条)
+    market = db.query(DWSMarketIndicators).filter(DWSMarketIndicators.ts_code == ts_code)\
+               .order_by(DWSMarketIndicators.trade_date.desc()).first()
+    if market:
+        print(f"⚖️ 行情检查: 日期={market.trade_date}, PE={market.pe_ttm}, PB={market.pb}, 市值={market.total_mv}")
+    else:
+        print("❌ 行情检查: DWSMarketIndicators 中无数据")
+
+    # 3. 检查 DWS 标准财务 (取最新一条)
+    finance = db.query(DWSFinanceStd).filter(DWSFinanceStd.ts_code == ts_code)\
+                .order_by(DWSFinanceStd.end_date.desc()).first()
+    if finance:
+        print(f"🏰 财务检查: 报告期={finance.end_date}, ROE={finance.roe}, 负债率={finance.debt_to_assets}")
+    else:
+        print("❌ 财务检查: DWSFinanceStd 中无数据")
+    
+    db.close()
+
+if __name__ == "__main__":
+    debug_haier()
+
+------------------------------------------------------------
 FILE PATH: main.py
 ------------------------------------------------------------
 # FILE PATH: main.py
-
-import os
-import sys
 from nicegui import ui
-
-# 路径防御：确保根目录在搜索路径中
-sys.path.append(os.path.abspath(os.path.dirname(__file__)))
-
 from ui.layout import theme_setup, shared_menu
 from ui.pages.console import ConsolePage
 from ui.pages.watchlist import WatchlistPage
+from ui.pages.radar import RadarPage
+
+# --- 注意：全局作用域严禁出现 ui.xxx 组件调用 ---
 
 @ui.page('/')
-def index():
-    theme_setup()
+def index_page():
+    theme_setup()   # 移动到函数内部
     shared_menu()
-    # 每次进入页面时实例化，确保获取最新的数据库会话
-    page = ConsolePage()
-    page.content()
+    # 实例化并渲染“数据维护”页面内容
+    ConsolePage().content()
 
-# 预留其他页面路由
 @ui.page('/radar')
 def radar_page():
-    theme_setup()
+    theme_setup()   # 移动到函数内部
     shared_menu()
-    ui.label('选股雷达 - 正在炼制中...').classes('text-h4 m-6')
+    # 实例化并渲染“选股雷达”页面内容
+    RadarPage().content()
 
 @ui.page('/watchlist')
 def watchlist_page():
-    theme_setup()
+    theme_setup()   # 移动到函数内部
     shared_menu()
+    # 实例化并渲染“自选管理”页面内容
     WatchlistPage().content()
 
-# 核心修复：修改启动守护条件
-if __name__ in {"__main__", "__mp_main__", "nicegui"}:
+# --- 核心修复：修改启动守卫 ---
+# 允许 NiceGUI 的多进程 (Multiprocessing) 和重载机制正常运行
+if __name__ in {"__main__", "__mp_main__"}:
     ui.run(
         title='Invest System V7.3',
         port=8080,
-        reload=True,   # 开发模式开启热重载
-        dark=False,    # 强制浅色模式以对齐设计稿
-        show=True      # 启动后自动打开浏览器
+        reload=True,  # 开启热重载，方便我们实时调试 UI
+        dark=False
     )
 
 ------------------------------------------------------------
@@ -191,6 +231,117 @@ if __name__ == "__main__":
     run_industrial_backfill()
 
 ------------------------------------------------------------
+FILE PATH: test_radar.py
+------------------------------------------------------------
+# FILE PATH: test_radar.py
+import sys
+import os
+
+# 1. 路径防御：确保脚本能识别根目录下的模块
+sys.path.append(os.path.abspath(os.path.dirname(__file__)))
+
+from engine.radar import RadarEngine
+
+def run_radar_smoke_test():
+    print("📡 === 选股雷达后端引擎 (B阶段) 冒烟测试 ===")
+    
+    # 2. 初始化引擎
+    engine = RadarEngine()
+    
+    try:
+        # 3. 传入 Coach 设定的典型参数进行回测
+        # 参数含义：ROE > 10%, PE < 25, 仅限中证800池
+        print("🔍 正在扫描中证800成份股 (基于 T-1 数据)...")
+        picks = engine.query(
+            min_roe=10.0, 
+            max_pe=25.0, 
+            pool='CSI800',
+            trend_up=True  # 过滤掉 20 日均线以下的标的
+        )
+        
+        # 4. 结果验证
+        if picks.empty:
+            print("⚠️ 未找到符合条件的标的，请检查：")
+            print("   - 数据库 DWS 表是否有数据？")
+            print("   - 筛选标准是否过严？")
+        else:
+            print(f"🎯 扫描成功！发现 {len(picks)} 只符合标准的“黄金标的”：")
+            # 打印前 10 名，查看关键指标对齐情况
+            print("-" * 80)
+            print(picks[['ts_code', 'name', 'roe', 'pe_ttm', 'total_mv_unit', 'last_report']].head(10))
+            print("-" * 80)
+
+    except Exception as e:
+        print(f"❌ 引擎运行报错: {str(e)}")
+    finally:
+        engine.close()
+
+if __name__ == "__main__":
+    run_radar_smoke_test()
+
+------------------------------------------------------------
+FILE PATH: test_sync_engine.py
+------------------------------------------------------------
+# FILE PATH: test_sync_engine.py
+import sys
+import os
+
+# 确保能加载项目模块
+sys.path.append(os.path.abspath(os.path.dirname(__file__)))
+
+from engine.updater import DataUpdater
+from database.models import SessionLocal, ODSMarketDaily, ODSFinanceReport, DWSMarketIndicators, DWSFinanceStd
+from sqlalchemy import func
+
+def run_test_sync(ts_code='600519.SH'):
+    print(f"🧪 === Invest System 引擎冒烟测试: {ts_code} ===")
+    updater = DataUpdater()
+    db = SessionLocal()
+
+    try:
+        # 1. 清理该标的既有数据 (为了测试纯净性)
+        print(f"🧹 正在清理 {ts_code} 的旧数据...")
+        db.query(ODSMarketDaily).filter(ODSMarketDaily.ts_code == ts_code).delete()
+        db.query(ODSFinanceReport).filter(ODSFinanceReport.ts_code == ts_code).delete()
+        db.commit()
+
+        # 2. 模拟 S1/S2 同步过程
+        print(f"📥 正在同步 ODS 原始数据 (从 2015-01-01 起)...")
+        # 备注：由于是生成器，这里模拟 UI 调用循环
+        updater.sync_stock_history(ts_code, start_date="20150101")
+        
+        # 3. 验证 ODS 落地情况
+        daily_count = db.query(ODSMarketDaily).filter(ODSMarketDaily.ts_code == ts_code).count()
+        finance_count = db.query(ODSFinanceReport).filter(ODSFinanceReport.ts_code == ts_code).count()
+        print(f"✅ ODS 落地检查：行情 {daily_count} 行, 财报 {finance_count} 份。")
+
+        # 4. 执行 DWS 炼制
+        print(f"⚙️ 正在执行 DWS 层衍生指标计算...")
+        updater.process_market_dws(ts_code)
+        updater.process_finance_dws(ts_code)
+
+        # 5. 验证 DWS 产出
+        latest_ma = db.query(DWSMarketIndicators).filter(DWSMarketIndicators.ts_code == ts_code).order_by(DWSMarketIndicators.trade_date.desc()).first()
+        std_finance = db.query(DWSFinanceStd).filter(DWSFinanceStd.ts_code == ts_code).count()
+        
+        if latest_ma:
+            print(f"📈 DWS 行情检查：最新收盘价(QFQ): {latest_ma.close_qfq:.2f}, MA250: {latest_ma.ma_250 or '计算中'}")
+        print(f"💰 DWS 财务检查：已炼制标准化财报 {std_finance} 条。")
+
+        if daily_count > 0 and finance_count > 0:
+            print("\n🎉 === 测试通过：同步引擎链路已打通！ ===")
+        else:
+            print("\n❌ === 测试失败：未获取到有效数据，请检查 Tushare Token 和网络 === ")
+
+    finally:
+        db.close()
+        updater.close()
+
+if __name__ == "__main__":
+    # 如果要测试多只标的，可以在此修改
+    run_test_sync('600519.SH')
+
+------------------------------------------------------------
 FILE PATH: ui/__init__.py
 ------------------------------------------------------------
 
@@ -206,19 +357,31 @@ def theme_setup():
     ui.query('body').style('font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #f8fafc;')
 
 def shared_menu():
-    """侧边栏导航组件"""
-    with ui.left_drawer(value=True).classes('bg-slate-100').props('bordered'):
-        ui.label('🏗️ INVEST SYSTEM').classes('text-xl font-bold m-4 text-blue-800')
-        ui.separator()
-        with ui.column().classes('w-full p-2 gap-2'):
-            ui.button('控制台', icon='dashboard', on_click=lambda: ui.navigate.to('/')).props('flat').classes('w-full justify-start')
-            ui.button('选股雷达', icon='radar', on_click=lambda: ui.navigate.to('/radar')).props('flat').classes('w-full justify-start')
-            ui.button('自选管理', icon='list', on_click=lambda: ui.navigate.to('/watchlist')).props('flat').classes('w-full justify-start')
-            ui.button('个股透视', icon='analytics', on_click=lambda: ui.navigate.to('/stock')).props('flat').classes('w-full justify-start')
+    """侧边栏导航组件 - 边距增强版"""
+    with ui.left_drawer(value=True).classes('bg-slate-50').props('bordered'):
+        # 标志区
+        ui.label('🏗️ INVEST SYSTEM').classes('text-lg font-bold mt-8 mb-4 ml-10 text-blue-900 tracking-tight')
+        ui.separator().classes('mx-6')
         
-        with ui.column().classes('absolute-bottom w-full p-4 text-slate-400 text-xs'):
+        # 导航菜单
+        with ui.column().classes('w-full mt-6 gap-2'):
+            # 增加 pl-10 (约 40px) 的左侧内边距，确保文字左对齐且有呼吸感
+            ui.button('数据维护', icon='settings', on_click=lambda: ui.navigate.to('/')) \
+                .props('flat no-caps').classes('w-full justify-start pl-10 text-slate-600 hover:text-blue-700 font-medium')
+            
+            ui.button('选股雷达', icon='radar', on_click=lambda: ui.navigate.to('/radar')) \
+                .props('flat no-caps').classes('w-full justify-start pl-10 text-slate-600 hover:text-blue-700 font-medium')
+            
+            ui.button('自选管理', icon='star_border', on_click=lambda: ui.navigate.to('/watchlist')) \
+                .props('flat no-caps').classes('w-full justify-start pl-10 text-slate-600 hover:text-blue-700 font-medium')
+            
+            ui.button('个股透视', icon='insights', on_click=lambda: ui.navigate.to('/stock')) \
+                .props('flat no-caps').classes('w-full justify-start pl-10 text-slate-600 hover:text-blue-700 font-medium')
+        
+        # 底部状态
+        with ui.column().classes('absolute-bottom w-full p-6 text-slate-400 text-[10px]'):
             ui.label('V7.3 Architect Edition')
-            ui.label('Tushare 2000+ pts Locked')
+            ui.label('DB FRESHNESS: 2025-12-19') # 动态日期可后续实装
 
 ------------------------------------------------------------
 FILE PATH: ui/pages/__init__.py
@@ -241,55 +404,189 @@ class ConsolePage:
         self.log_view = None
 
     async def run_task(self, task_func):
+        """通用异步任务处理器"""
         if self.log_view:
             self.log_view.push(f"[{datetime.now().strftime('%H:%M:%S')}] 🚀 启动...")
-        for message in task_func():
-            self.log_view.push(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
-            await asyncio.sleep(0.01)
+        try:
+            # 这里的 task_func 是 updater 中的生成器函数
+            for message in task_func():
+                self.log_view.push(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+                # 强制 UI 刷新，防止日志堆积导致的浏览器卡顿
+                await asyncio.sleep(0.01)
+        except Exception as e:
+            self.log_view.push(f"❌ 运行异常: {str(e)}")
 
     def content(self):
         with ui.column().classes('w-full p-8 max-w-6xl mx-auto'):
-            ui.label('⚙️ 系统控制台').classes('text-3xl font-light text-slate-700 mb-8')
+            # 标题更名：从“系统控制台”改为“数据维护”
+            ui.label('⚙️ 数据维护').classes('text-3xl font-light text-slate-700 mb-8')
             
-            # 极简磁贴布局
+            # 四磁贴布局 (对齐你的截图样式)
             with ui.row().classes('w-full gap-6'):
                 
-                # 场景 S3/S4
+                # 磁贴 1: 日常同步 (S3/S4)
                 with ui.card().props('flat bordered').classes('p-6 flex-1 bg-white'):
                     ui.label('日常同步').classes('text-xs text-slate-400 uppercase tracking-widest')
                     ui.label('收盘数据补全').classes('text-lg font-medium mb-4')
                     ui.button('一键日更', on_click=lambda: self.run_task(self.updater.run_daily_routine)) \
-                        .props('flat color=primary').classes('px-4 border border-slate-200') \
-                        .tooltip('同步全市场最新行情、每日指标及当日披露的财报 (S3/S4)')
+                        .props('flat color=primary').classes('px-4 border border-slate-200')
 
                 # 磁贴 2: 元数据同步 (CSI800)
                 with ui.card().props('flat bordered').classes('p-6 flex-1 bg-white'):
                     ui.label('底座维护').classes('text-xs text-slate-400 uppercase tracking-widest')
                     ui.label('同步成分股').classes('text-lg font-medium mb-4')
                     ui.button('同步 CSI800', on_click=lambda: self.run_task(self.updater.sync_stock_list)) \
-                        .props('flat color=primary').classes('px-4 border border-slate-200') \
-                        .tooltip('更新全市场股票清单并重新标记中证800成分股状态')
+                        .props('flat color=primary').classes('px-4 border border-slate-200')
 
                 # 磁贴 3: 初始化 (S5)
                 with ui.card().props('flat bordered').classes('p-6 flex-1 bg-white'):
                     ui.label('初始化').classes('text-xs text-slate-400 uppercase tracking-widest')
                     ui.label('核心池全回溯').classes('text-lg font-medium mb-4')
                     ui.button('开始回溯', on_click=lambda: self.run_task(self.updater.run_full_backfill)) \
-                        .props('flat color=primary').classes('px-4 border border-slate-200') \
-                        .tooltip('针对中证800个股，从2015年起补全所有历史财务与行情数据 (S5)')
+                        .props('flat color=primary').classes('px-4 border border-slate-200')
 
-                # 磁贴 4: 自选维护 (S1/S2)
+                # 磁贴 4: 专项同步 (S1/S2) - 修正点
                 with ui.card().props('flat bordered').classes('p-6 flex-1 bg-white'):
                     ui.label('专项同步').classes('text-xs text-slate-400 uppercase tracking-widest')
-                    ui.label('自选数据修补').classes('text-lg font-medium mb-4')
-                    ui.button('立即修补', on_click=lambda: ui.notify('专项功能开发中...')) \
-                        .props('flat color=primary').classes('px-4 border border-slate-200') \
-                        .tooltip('检查并补全自选股池中个股的历史数据断档 (S1/S2)')
+                    ui.label('自选池深度同步').classes('text-lg font-medium mb-4')
+                    ui.button('立即同步自选池', on_click=lambda: self.run_task(self.updater.run_watchlist_backfill)) \
+                        .props('flat color=primary').classes('px-4 border border-slate-200')
 
             # 极简日志区
             ui.label('📡 实时日志').classes('text-sm font-medium text-slate-500 mt-12 mb-2')
             with ui.card().props('flat').classes('w-full bg-slate-900 overflow-hidden rounded-lg'):
                 self.log_view = ui.log().classes('w-full h-80 text-emerald-400 font-mono text-[11px] p-6')
+
+------------------------------------------------------------
+FILE PATH: ui/pages/radar.py
+------------------------------------------------------------
+# FILE PATH: ui/pages/radar.py
+from nicegui import ui
+from engine.radar import RadarEngine
+import pandas as pd
+import json
+import os
+from datetime import datetime
+from core.mapping import FIELD_MAPPING
+
+class RadarPage:
+    def __init__(self):
+        self.engine = RadarEngine()
+        self.grid = None
+        self.stats_label = None
+        self.current_df = pd.DataFrame()
+
+    def update_data(self):
+        """核心交互逻辑"""
+        try:
+            df = self.engine.query(
+                min_roe=float(self.roe_slider.value),
+                max_pe=float(self.pe_slider.value),
+                max_pb=float(self.pb_slider.value),
+                min_mv=float(self.mv_slider.value),
+                pool=self.pool_select.value,
+                trend_up=self.trend_toggle.value
+            )
+            self.current_df = df
+            records = json.loads(df.to_json(orient='records', date_format='iso'))
+            
+            if self.stats_label:
+                count = len(records)
+                self.stats_label.set_text(f"🎯 雷达发现: {count} 只标的")
+                self.stats_label.classes('text-emerald-600' if count > 0 else 'text-rose-600', remove='text-rose-600 text-emerald-600')
+
+            if self.grid:
+                self.grid.options['rowData'] = records
+                self.grid.update()
+        except Exception as e:
+            ui.notify(f"扫描异常: {str(e)}", type='negative')
+
+    def get_export_path(self):
+        """Chrome 风格导出路径"""
+        downloads_path = os.path.join(os.path.expanduser("~"), "Downloads")
+        target_dir = os.path.join(downloads_path, "InvestSystem_Exports")
+        os.makedirs(target_dir, exist_ok=True)
+        return target_dir
+
+    def export_data(self):
+        """导出结果"""
+        if self.current_df.empty:
+            ui.notify("结果为空", type='warning')
+            return
+        try:
+            target_dir = self.get_export_path()
+            filename = f"Radar_Picks_{datetime.now().strftime('%m%d_%H%M')}.xlsx"
+            filepath = os.path.join(target_dir, filename)
+            available_cols = [col for col in self.current_df.columns if col in FIELD_MAPPING]
+            export_df = self.current_df[available_cols].rename(columns=FIELD_MAPPING)
+            export_df.to_excel(filepath, index=False)
+            ui.notify(f"🚀 已导出: {filename}", type='positive')
+        except Exception as e:
+            ui.notify(f"导出失败: {str(e)}")
+
+    def _create_compact_control(self, label, min_v, max_v, step_v, default_v, unit=""):
+        """【架构师重制】优化宽度的水平控制组 """
+        with ui.row().classes('items-center gap-3 w-full px-2 py-1 hover:bg-slate-50 rounded transition-all'):
+            # 标签区
+            ui.label(label).classes('text-[11px] font-bold text-slate-400 uppercase w-12 leading-tight')
+            # 滑块区
+            slider = ui.slider(min=min_v, max=max_v, step=step_v, value=default_v).classes('flex-grow')
+            # 数字框 (扩容至 w-24，并增加外边距)
+            number = ui.number(value=default_v, min=min_v, max=max_v, step=step_v, format='%.1f') \
+                .props('dense outlined size=10').classes('w-24 text-[12px] bg-white') \
+                .bind_value(slider, 'value')
+            
+            ui.label(unit).classes('text-[10px] text-slate-400 w-4')
+            
+            slider.on_value_change(self.update_data)
+            number.on_value_change(self.update_data)
+            return slider
+
+    def content(self):
+        with ui.column().classes('w-full p-4 max-w-7xl mx-auto gap-4'):
+            # 顶层头部
+            with ui.row().classes('w-full items-center justify-between'):
+                with ui.row().classes('items-center gap-4'):
+                    ui.label('📡 选股雷达').classes('text-2xl font-light text-slate-700')
+                    self.pool_select = ui.select(
+                        options={'CSI800': '中证800', 'Watchlist': '自选池', 'All': '全市场'},
+                        value='CSI800'
+                    ).props('dense flat').classes('w-32').on_value_change(self.update_data)
+                    self.trend_toggle = ui.switch('趋势向上', value=False).props('dense').on_value_change(self.update_data)
+                
+                with ui.row().classes('gap-3'):
+                    self.stats_label = ui.label('正在预热...').classes('text-sm font-bold font-mono py-1')
+                    ui.button(icon='download', on_click=self.export_data).props('flat round dense').tooltip('导出 Excel')
+
+            # 2. 战略参数区
+            with ui.card().props('flat bordered').classes('w-full p-2 bg-white rounded-lg shadow-sm'):
+                with ui.grid(columns=4).classes('w-full divide-x divide-slate-100'):
+                    self.roe_slider = self._create_compact_control('ROE%', 0, 40, 0.5, 10)
+                    self.pe_slider = self._create_compact_control('PE', 1, 100, 1, 25)
+                    self.pb_slider = self._create_compact_control('PB', 0.1, 10, 0.1, 3)
+                    self.mv_slider = self._create_compact_control('市值', 0, 5000, 50, 100, "亿")
+
+            # 3. 结果网格
+            with ui.card().props('flat bordered').classes('w-full p-0 overflow-hidden bg-white rounded-lg'):
+                self.grid = ui.aggrid({
+                    'columnDefs': [
+                        {'headerName': '代码', 'field': 'ts_code', 'width': 95, 'pinned': 'left'},
+                        {'headerName': '名称', 'field': 'name', 'width': 105, 'pinned': 'left'},
+                        {'headerName': '行业', 'field': 'industry', 'width': 130},
+                        {'headerName': 'ROE %', 'field': 'roe', 'width': 90, 'sortable': True, 'cellClass': 'font-bold text-emerald-700'},
+                        {'headerName': 'PE(TTM)', 'field': 'pe_ttm', 'width': 90, 'sortable': True},
+                        {'headerName': 'PB', 'field': 'pb', 'width': 85, 'sortable': True},
+                        {'headerName': '市值(亿)', 'field': 'total_mv_unit', 'width': 105, 'sortable': True},
+                        {'headerName': '今日涨跌', 'field': 'pct_chg', 'width': 100, 'sortable': True, ':cellRenderer': 'p => p.value > 0 ? "🔴 " + p.value + "%" : "🟢 " + p.value + "%"'},
+                        {'headerName': '最新财报', 'field': 'last_report', 'width': 105},
+                    ],
+                    'rowData': [],
+                    'pagination': True,
+                    'paginationPageSize': 50,
+                    'theme': 'balham'
+                }).classes('w-full h-[650px]')
+
+            ui.timer(0.5, self.update_data, once=True)
 
 ------------------------------------------------------------
 FILE PATH: ui/pages/watchlist.py
@@ -1551,6 +1848,92 @@ REPORT_TYPE_MAP = {
 }
 
 ------------------------------------------------------------
+FILE PATH: engine/radar.py
+------------------------------------------------------------
+# FILE PATH: engine/radar.py
+import pandas as pd
+from sqlalchemy import text, func
+from database.models import SessionLocal, StockBasic, DWSMarketIndicators, DWSFinanceStd
+
+class RadarEngine:
+    def __init__(self):
+        self.db = SessionLocal()
+
+    def query(self, 
+              min_roe=8.0,           # 核心：ROE 扣非
+              max_pe=30.0,           # 估值：PE(TTM)
+              max_pb=3.0,            # 估值：PB
+              min_mv=100.0,          # 规模：总市值(亿)
+              max_debt=60.0,         # 风险：负债率
+              trend_up=True,         # 趋势：收盘 > MA20
+              pool='CSI800'          # 范围：CSI800 / Watchlist / All
+              ):
+        """
+        [PRD 3.2] 选股雷达核心筛选逻辑
+        """
+        # 1. 获取数据库最新行情日期 (T-1 后视镜)
+        latest_date = self.db.query(func.max(DWSMarketIndicators.trade_date)).scalar()
+        if not latest_date:
+            return pd.DataFrame()
+
+        # 2. 构建三表关联查询 (SQL 模式以提升性能)
+        # 关联: Basic(B) -> Indicators(I) -> Finance(F)
+        # 注意: Finance 取最近一个报告期 (end_date)
+        # --- 架构级修复：联接 ODS 获取原始涨跌幅 ---
+        sql = text("""
+            SELECT 
+                b.ts_code, b.name, b.industry,
+                i.trade_date, i.close_qfq, i.pe_ttm, i.pb, i.total_mv, i.ma_20,
+                m.pct_chg,
+                f.end_date as last_report, 
+                COALESCE(f.roe, 0) as roe, -- 这里暂时取 f.roe，我们将修改 process_finance_dws 来填充它
+                f.debt_to_assets
+            FROM stock_basic b
+            JOIN dws_market_indicators i ON b.ts_code = i.ts_code
+            JOIN ods_market_daily m ON i.ts_code = m.ts_code AND i.trade_date = m.trade_date
+            LEFT JOIN (
+                SELECT DISTINCT ON (ts_code) *
+                FROM dws_finance_std
+                ORDER BY ts_code, end_date DESC
+            ) f ON b.ts_code = f.ts_code
+            WHERE i.trade_date = :t_date
+            AND (:pool = 'All' OR 
+                (:pool = 'CSI800' AND b.is_csi800 = True) OR
+                (:pool = 'Watchlist' AND b.ts_code IN (SELECT ts_code FROM watchlist))
+            )
+        """)
+
+        df = pd.read_sql(sql, self.db.bind, params={"t_date": latest_date, "pool": pool})
+        if df.empty: return df
+
+        # --- 架构级修复：处理空值防止误杀 ---
+        # 将 ROE 缺失填充为 0，负债率缺失填充为 0 (代表风险未知但不拦截)
+        df['roe'] = df['roe'].fillna(0)
+        df['debt_to_assets'] = df['debt_to_assets'].fillna(0)
+        df['pe_ttm'] = df['pe_ttm'].fillna(999) # PE 缺失则设为极大值拦截
+
+        # 3. 执行多因子过滤
+        mask = (
+            (df['pe_ttm'] > 0) & (df['pe_ttm'] < max_pe) &
+            (df['pb'] < max_pb) &
+            (df['total_mv'] >= min_mv * 10000) & # 亿元转万元
+            (df['roe'] >= min_roe) &
+            (df['debt_to_assets'] <= max_debt)
+        )
+        
+        if trend_up:
+            mask = mask & (df['close_qfq'] > df['ma_20'])
+
+        result = df[mask].copy()
+        
+        # 格式化输出
+        result['total_mv_unit'] = (result['total_mv'] / 10000).round(2) # 转回亿元显示
+        return result.sort_values('roe', ascending=False)
+
+    def close(self):
+        self.db.close()
+
+------------------------------------------------------------
 FILE PATH: engine/updater.py
 ------------------------------------------------------------
 import pandas as pd
@@ -1615,12 +1998,43 @@ class DataUpdater:
 
     # --- 场景 S1/S2/S5: 垂直历史回溯 (按代码同步) ---
 
-    def sync_stock_history(self, ts_code: str, start_date="20150101"):
-        """补全单只股票的所有历史数据 (行情+财报)"""
-        # 1. 行情与复权因子 [cite: 15-16]
-        df_daily = ts_client.fetch_daily(ts_code=ts_code, start_date=start_date)
-        df_adj = ts_client.fetch_adj_factor(ts_code=ts_code, start_date=start_date)
+    def run_watchlist_backfill(self):
+        """
+        [PRD S1/S2] 自选股行情与财报深度修补
+        逻辑：针对 Watchlist 中的标的，从 20150101 起执行垂直同步 
+        """
+        watchlist = self.db.query(Watchlist.ts_code).all()
+        targets = [r.ts_code for r in watchlist]
         
+        if not targets:
+            yield "⚠️ 自选池为空，请先在页面添加标的。"
+            return
+
+        total = len(targets)
+        yield f"🚀 启动自选池深度同步：共 {total} 只标的"
+
+        for i, ts_code in enumerate(targets):
+            yield f"正在处理 [{i+1}/{total}]: {ts_code}"
+            try:
+                # 1. 执行 ODS 层垂直拉取 (行情+财报)
+                self.sync_stock_history(ts_code, start_date="20150101")
+                
+                # 2. 执行 DWS 层数据炼制 (计算均线与标准化财报)
+                self.process_market_dws(ts_code)
+                self.process_finance_dws(ts_code)
+                
+                # 3. 2000 积分频次保护：每次同步后休眠 0.3s-0.5s [cite: 1635]
+                time.sleep(0.3)
+            except Exception as e:
+                yield f"❌ {ts_code} 同步失败: {str(e)}"
+                continue
+        
+        yield "✅ 自选池历史数据修复完成。"
+
+    def sync_stock_history(self, ts_code: str, start_date="20150101"):
+        """补全单只股票的所有历史数据 (ODS 层)"""
+        # A. 行情数据同步
+        df_daily = ts_client.fetch_daily(ts_code=ts_code, start_date=start_date)
         if not df_daily.empty:
             for _, row in df_daily.iterrows():
                 self.db.merge(ODSMarketDaily(
@@ -1630,14 +2044,23 @@ class DataUpdater:
                     vol=row['vol'], amount=row['amount']
                 ))
 
+        # B. 复权因子同步 [cite: 1760]
+        df_adj = ts_client.fetch_adj_factor(ts_code=ts_code, start_date=start_date)
         if not df_adj.empty:
             for _, row in df_adj.iterrows():
                 self.db.merge(ODSAdjFactor(ts_code=row['ts_code'], trade_date=row['trade_date'], adj_factor=row['adj_factor']))
 
-        # 1.1 每日指标 (PE/PB/市值)
-        self.sync_daily_basic(ts_code, start_date)
+        # C. 每日指标同步 (PE/PB/市值) [cite: 1766]
+        df_basic = ts_client.pro.daily_basic(ts_code=ts_code, start_date=start_date)
+        if not df_basic.empty:
+            for _, row in df_basic.iterrows():
+                self.db.merge(ODSDailyBasic(
+                    ts_code=row['ts_code'], trade_date=row['trade_date'],
+                    pe_ttm=row.get('pe_ttm'), pb=row.get('pb'), 
+                    turnover_rate=row.get('turnover_rate'), total_mv=row.get('total_mv')
+                ))
 
-        # 2. 四大财报同步 (JSONB 存储) [cite: 90-95]
+        # D. 四大财报同步 (JSONB 存储) [cite: 1761]
         tasks = {
             "income": ts_client.fetch_income,
             "balancesheet": ts_client.fetch_balancesheet,
@@ -1646,41 +2069,31 @@ class DataUpdater:
         }
         for category, api_func in tasks.items():
             df = api_func(ts_code=ts_code, start_date=start_date)
-            if not df.empty:
-                # --- 核心修复：内存预去重 ---
-                # 定义我们的五维主键 (category 在循环中固定)
-                pk_cols = ['ts_code', 'end_date', 'report_type', 'update_flag']
-                # Tushare 接口返回的字段名可能略有不同，先做个安全检查
-                actual_pk = [c for c in pk_cols if c in df.columns]
-                # 根据主键去重，保留最后一条（通常是最新的）
+            if df is not None and not df.empty:
+                # --- 架构级修复：动态检测主键 --- 
+                # 理想的主键候选，但需兼容不同接口的字段差异
+                pk_candidates = ['ts_code', 'end_date', 'report_type', 'update_flag']
+                actual_pk = [col for col in pk_candidates if col in df.columns]
+                
+                # 执行安全去重：根据存在的字段保留最新一条 
                 df = df.drop_duplicates(subset=actual_pk, keep='last')
 
+                # 处理 NaN 并在字典转换时填充 None，防止 JSONB 写入报错 
                 df = df.astype(object).where(pd.notnull(df), None)
+                
                 for record in df.to_dict('records'):
+                    # 写入 ODS 时使用 .get() 兜底可选字段 [cite: 864-865]
                     self.db.merge(ODSFinanceReport(
-                        ts_code=record['ts_code'], end_date=record['end_date'],
-                        report_type=record.get('report_type', '1'),
-                        update_flag=record.get('update_flag', '0'),
-                        category=category, data=record, ann_date=record.get('ann_date')
+                        ts_code=record['ts_code'], 
+                        end_date=record['end_date'],
+                        # 默认合并报表(1)和初始数据(0)以对齐数据库模型要求 [cite: 769, 864]
+                        report_type=str(record.get('report_type', '1')), 
+                        update_flag=str(record.get('update_flag', '0')), 
+                        category=category, 
+                        data=record, 
+                        ann_date=record.get('ann_date')
                     ))
-                # 每一类报表提交一次，缩小冲突范围并提升调试效率
-                self.db.commit()
-
-    def sync_daily_basic(self, ts_code: str, start_date: str):
-        """同步 ODS 层每日指标"""
-        df = ts_client.pro.daily_basic(ts_code=ts_code, start_date=start_date)
-        if df.empty: return
-        
-        for _, row in df.iterrows():
-            self.db.merge(ODSDailyBasic(
-                ts_code=row['ts_code'],
-                trade_date=row['trade_date'],
-                pe_ttm=row.get('pe_ttm'),
-                pb=row.get('pb'),
-                turnover_rate=row.get('turnover_rate'),
-                total_mv=row.get('total_mv')
-            ))
-        self.db.commit()
+                self.db.commit() # 每一类报表提交一次，缩小冲突范围 [cite: 865]
 
     # --- 场景 S3: 水平每日行情 (按日期同步) ---
 
@@ -1814,7 +2227,7 @@ class DataUpdater:
         self.db.commit()
 
     def process_finance_dws(self, ts_code: str):
-        """DWS: 标准化财务炼制 (行业感知版) [cite: 845-848]"""
+        """[核心修复] 炼制时自动合并 roe 与 roe_dt"""
         reports = self.db.query(ODSFinanceReport).filter(
             ODSFinanceReport.ts_code == ts_code,
             ODSFinanceReport.report_type == '1'
@@ -1826,11 +2239,28 @@ class DataUpdater:
             if end_date not in merged:
                 merged[end_date] = {"ann_date": r.ann_date}
             
-            # 关键：从 JSONB 中提取字段并覆盖合并 [cite: 847]
             data = r.data
-            for k in ['revenue', 'n_income_attr_p', 'n_cashflow_act', 'debt_to_assets', 'roe', 'grossprofit_margin']:
+            for k in ['revenue', 'n_income_attr_p', 'n_cashflow_act', 'grossprofit_margin']:
                 if k in data and data[k] is not None:
                     merged[end_date][k] = data[k]
+            
+            # --- 增强：负债率多路径提取 ---
+            debt_ratio = data.get('debt_to_assets')
+            if debt_ratio is None:
+                # 尝试通过 总负债(total_liab) / 总资产(total_assets) 计算
+                liab = data.get('total_liab')
+                assets = data.get('total_assets')
+                if liab and assets and assets != 0:
+                    debt_ratio = (liab / assets) * 100
+            
+            if debt_ratio is not None:
+                merged[end_date]['debt_to_assets'] = debt_ratio
+
+            # --- 关键逻辑：扣非 ROE 优先级 ---
+            # 优先取 roe_dt (扣非)，如果没有，取 roe (加权)
+            roe_final = data.get('roe_dt') if data.get('roe_dt') is not None else data.get('roe')
+            if roe_final is not None:
+                merged[end_date]['roe'] = roe_final
         
         for end_date, m in merged.items():
             # 必须有公告日期才能进行后续的 merge_asof [cite: 847]

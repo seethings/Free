@@ -1,43 +1,39 @@
 # FILE PATH: main.py
-
-import os
-import sys
 from nicegui import ui
-
-# 路径防御：确保根目录在搜索路径中
-sys.path.append(os.path.abspath(os.path.dirname(__file__)))
-
 from ui.layout import theme_setup, shared_menu
 from ui.pages.console import ConsolePage
 from ui.pages.watchlist import WatchlistPage
+from ui.pages.radar import RadarPage
+
+# --- 注意：全局作用域严禁出现 ui.xxx 组件调用 ---
 
 @ui.page('/')
-def index():
-    theme_setup()
+def index_page():
+    theme_setup()   # 移动到函数内部
     shared_menu()
-    # 每次进入页面时实例化，确保获取最新的数据库会话
-    page = ConsolePage()
-    page.content()
+    # 实例化并渲染“数据维护”页面内容
+    ConsolePage().content()
 
-# 预留其他页面路由
 @ui.page('/radar')
 def radar_page():
-    theme_setup()
+    theme_setup()   # 移动到函数内部
     shared_menu()
-    ui.label('选股雷达 - 正在炼制中...').classes('text-h4 m-6')
+    # 实例化并渲染“选股雷达”页面内容
+    RadarPage().content()
 
 @ui.page('/watchlist')
 def watchlist_page():
-    theme_setup()
+    theme_setup()   # 移动到函数内部
     shared_menu()
+    # 实例化并渲染“自选管理”页面内容
     WatchlistPage().content()
 
-# 核心修复：修改启动守护条件
-if __name__ in {"__main__", "__mp_main__", "nicegui"}:
+# --- 核心修复：修改启动守卫 ---
+# 允许 NiceGUI 的多进程 (Multiprocessing) 和重载机制正常运行
+if __name__ in {"__main__", "__mp_main__"}:
     ui.run(
         title='Invest System V7.3',
         port=8080,
-        reload=True,   # 开发模式开启热重载
-        dark=False,    # 强制浅色模式以对齐设计稿
-        show=True      # 启动后自动打开浏览器
+        reload=True,  # 开启热重载，方便我们实时调试 UI
+        dark=False
     )

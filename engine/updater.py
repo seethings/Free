@@ -60,12 +60,43 @@ class DataUpdater:
 
     # --- 场景 S1/S2/S5: 垂直历史回溯 (按代码同步) ---
 
-    def sync_stock_history(self, ts_code: str, start_date="20150101"):
-        """补全单只股票的所有历史数据 (行情+财报)"""
-        # 1. 行情与复权因子 [cite: 15-16]
-        df_daily = ts_client.fetch_daily(ts_code=ts_code, start_date=start_date)
-        df_adj = ts_client.fetch_adj_factor(ts_code=ts_code, start_date=start_date)
+    def run_watchlist_backfill(self):
+        """
+        [PRD S1/S2] 自选股行情与财报深度修补
+        逻辑：针对 Watchlist 中的标的，从 20150101 起执行垂直同步 
+        """
+        watchlist = self.db.query(Watchlist.ts_code).all()
+        targets = [r.ts_code for r in watchlist]
         
+        if not targets:
+            yield "⚠️ 自选池为空，请先在页面添加标的。"
+            return
+
+        total = len(targets)
+        yield f"🚀 启动自选池深度同步：共 {total} 只标的"
+
+        for i, ts_code in enumerate(targets):
+            yield f"正在处理 [{i+1}/{total}]: {ts_code}"
+            try:
+                # 1. 执行 ODS 层垂直拉取 (行情+财报)
+                self.sync_stock_history(ts_code, start_date="20150101")
+                
+                # 2. 执行 DWS 层数据炼制 (计算均线与标准化财报)
+                self.process_market_dws(ts_code)
+                self.process_finance_dws(ts_code)
+                
+                # 3. 2000 积分频次保护：每次同步后休眠 0.3s-0.5s [cite: 1635]
+                time.sleep(0.3)
+            except Exception as e:
+                yield f"❌ {ts_code} 同步失败: {str(e)}"
+                continue
+        
+        yield "✅ 自选池历史数据修复完成。"
+
+    def sync_stock_history(self, ts_code: str, start_date="20150101"):
+        """补全单只股票的所有历史数据 (ODS 层)"""
+        # A. 行情数据同步
+        df_daily = ts_client.fetch_daily(ts_code=ts_code, start_date=start_date)
         if not df_daily.empty:
             for _, row in df_daily.iterrows():
                 self.db.merge(ODSMarketDaily(
@@ -75,14 +106,23 @@ class DataUpdater:
                     vol=row['vol'], amount=row['amount']
                 ))
 
+        # B. 复权因子同步 [cite: 1760]
+        df_adj = ts_client.fetch_adj_factor(ts_code=ts_code, start_date=start_date)
         if not df_adj.empty:
             for _, row in df_adj.iterrows():
                 self.db.merge(ODSAdjFactor(ts_code=row['ts_code'], trade_date=row['trade_date'], adj_factor=row['adj_factor']))
 
-        # 1.1 每日指标 (PE/PB/市值)
-        self.sync_daily_basic(ts_code, start_date)
+        # C. 每日指标同步 (PE/PB/市值) [cite: 1766]
+        df_basic = ts_client.pro.daily_basic(ts_code=ts_code, start_date=start_date)
+        if not df_basic.empty:
+            for _, row in df_basic.iterrows():
+                self.db.merge(ODSDailyBasic(
+                    ts_code=row['ts_code'], trade_date=row['trade_date'],
+                    pe_ttm=row.get('pe_ttm'), pb=row.get('pb'), 
+                    turnover_rate=row.get('turnover_rate'), total_mv=row.get('total_mv')
+                ))
 
-        # 2. 四大财报同步 (JSONB 存储) [cite: 90-95]
+        # D. 四大财报同步 (JSONB 存储) [cite: 1761]
         tasks = {
             "income": ts_client.fetch_income,
             "balancesheet": ts_client.fetch_balancesheet,
@@ -91,41 +131,31 @@ class DataUpdater:
         }
         for category, api_func in tasks.items():
             df = api_func(ts_code=ts_code, start_date=start_date)
-            if not df.empty:
-                # --- 核心修复：内存预去重 ---
-                # 定义我们的五维主键 (category 在循环中固定)
-                pk_cols = ['ts_code', 'end_date', 'report_type', 'update_flag']
-                # Tushare 接口返回的字段名可能略有不同，先做个安全检查
-                actual_pk = [c for c in pk_cols if c in df.columns]
-                # 根据主键去重，保留最后一条（通常是最新的）
+            if df is not None and not df.empty:
+                # --- 架构级修复：动态检测主键 --- 
+                # 理想的主键候选，但需兼容不同接口的字段差异
+                pk_candidates = ['ts_code', 'end_date', 'report_type', 'update_flag']
+                actual_pk = [col for col in pk_candidates if col in df.columns]
+                
+                # 执行安全去重：根据存在的字段保留最新一条 
                 df = df.drop_duplicates(subset=actual_pk, keep='last')
 
+                # 处理 NaN 并在字典转换时填充 None，防止 JSONB 写入报错 
                 df = df.astype(object).where(pd.notnull(df), None)
+                
                 for record in df.to_dict('records'):
+                    # 写入 ODS 时使用 .get() 兜底可选字段 [cite: 864-865]
                     self.db.merge(ODSFinanceReport(
-                        ts_code=record['ts_code'], end_date=record['end_date'],
-                        report_type=record.get('report_type', '1'),
-                        update_flag=record.get('update_flag', '0'),
-                        category=category, data=record, ann_date=record.get('ann_date')
+                        ts_code=record['ts_code'], 
+                        end_date=record['end_date'],
+                        # 默认合并报表(1)和初始数据(0)以对齐数据库模型要求 [cite: 769, 864]
+                        report_type=str(record.get('report_type', '1')), 
+                        update_flag=str(record.get('update_flag', '0')), 
+                        category=category, 
+                        data=record, 
+                        ann_date=record.get('ann_date')
                     ))
-                # 每一类报表提交一次，缩小冲突范围并提升调试效率
-                self.db.commit()
-
-    def sync_daily_basic(self, ts_code: str, start_date: str):
-        """同步 ODS 层每日指标"""
-        df = ts_client.pro.daily_basic(ts_code=ts_code, start_date=start_date)
-        if df.empty: return
-        
-        for _, row in df.iterrows():
-            self.db.merge(ODSDailyBasic(
-                ts_code=row['ts_code'],
-                trade_date=row['trade_date'],
-                pe_ttm=row.get('pe_ttm'),
-                pb=row.get('pb'),
-                turnover_rate=row.get('turnover_rate'),
-                total_mv=row.get('total_mv')
-            ))
-        self.db.commit()
+                self.db.commit() # 每一类报表提交一次，缩小冲突范围 [cite: 865]
 
     # --- 场景 S3: 水平每日行情 (按日期同步) ---
 
@@ -259,7 +289,7 @@ class DataUpdater:
         self.db.commit()
 
     def process_finance_dws(self, ts_code: str):
-        """DWS: 标准化财务炼制 (行业感知版) [cite: 845-848]"""
+        """[核心修复] 炼制时自动合并 roe 与 roe_dt"""
         reports = self.db.query(ODSFinanceReport).filter(
             ODSFinanceReport.ts_code == ts_code,
             ODSFinanceReport.report_type == '1'
@@ -271,11 +301,28 @@ class DataUpdater:
             if end_date not in merged:
                 merged[end_date] = {"ann_date": r.ann_date}
             
-            # 关键：从 JSONB 中提取字段并覆盖合并 [cite: 847]
             data = r.data
-            for k in ['revenue', 'n_income_attr_p', 'n_cashflow_act', 'debt_to_assets', 'roe', 'grossprofit_margin']:
+            for k in ['revenue', 'n_income_attr_p', 'n_cashflow_act', 'grossprofit_margin']:
                 if k in data and data[k] is not None:
                     merged[end_date][k] = data[k]
+            
+            # --- 增强：负债率多路径提取 ---
+            debt_ratio = data.get('debt_to_assets')
+            if debt_ratio is None:
+                # 尝试通过 总负债(total_liab) / 总资产(total_assets) 计算
+                liab = data.get('total_liab')
+                assets = data.get('total_assets')
+                if liab and assets and assets != 0:
+                    debt_ratio = (liab / assets) * 100
+            
+            if debt_ratio is not None:
+                merged[end_date]['debt_to_assets'] = debt_ratio
+
+            # --- 关键逻辑：扣非 ROE 优先级 ---
+            # 优先取 roe_dt (扣非)，如果没有，取 roe (加权)
+            roe_final = data.get('roe_dt') if data.get('roe_dt') is not None else data.get('roe')
+            if roe_final is not None:
+                merged[end_date]['roe'] = roe_final
         
         for end_date, m in merged.items():
             # 必须有公告日期才能进行后续的 merge_asof [cite: 847]
